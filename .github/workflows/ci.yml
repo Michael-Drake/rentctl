@@ -1,0 +1,48 @@
+# CI for the public rentctl repo.
+#
+# SOURCE FILE — this is not wired to anything in the private repo. `publish.py`
+# copies it to `.github/workflows/ci.yml` in the published tree. Kept out of
+# `.github/` here deliberately so the private repo does not start running
+# Actions (and billing minutes) as a side effect of the split.
+#
+# Linux is the point of this file, not an afterthought. `core/procutil.py`
+# selects `psutil` as the PRIMARY port-probe backend on every non-macOS host,
+# and `test_psutil_backend_finds_this_process` SKIPS on macOS because
+# `psutil.net_connections` needs root there. Developed only on a Mac, that
+# backend's success path had never executed anywhere. On ubuntu-latest the
+# call is unprivileged, so the test actually runs — this workflow is the only
+# place the Linux probe is exercised at all.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Run the suite
+        # -rs surfaces skips. A skipped test reports identically to a passing
+        # one in default output, which is how the Linux gap above stayed
+        # invisible; if something skips here we want to see which.
+        run: uv run --extra dev pytest -q -rs
+
+      - name: Check core/ coverage
+        # core/ is the release gate at >= 90% (spec §10). The runners, CLI and
+        # MCP shell are thin wrappers over it and are covered by the
+        # integration tests rather than this number.
+        run: uv run --extra dev pytest -q --cov --cov-fail-under=90

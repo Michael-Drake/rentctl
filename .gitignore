@@ -1,0 +1,33 @@
+# uv's lockfile, deliberately NOT committed (the decision, so it does not get
+# quietly reversed). uv's own guidance is to commit a lockfile for applications
+# and not for distributed libraries, and rentctl is the latter: it is installed
+# with `pip install rentctl` / `uv tool install rentctl`, neither of which reads
+# a lockfile, so committing one would constrain nothing that actually ships.
+#
+# It would, however, change what CI tests — `uv run` would resolve to the pinned
+# set instead of re-resolving the declared ranges. That is the wrong trade here.
+# The `mcp>=1.2.0,<2` bound exists because an unbounded range resolved to a
+# version where the MCP server failed at import, and the reason that stayed
+# invisible was an environment holding a known-good version. Fresh resolution in
+# CI is the detector for that exact class of break; a lockfile is the thing that
+# would have hidden it again.
+uv.lock
+
+# Python build / test artifacts
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*.swo
+*~

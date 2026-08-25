@@ -1,0 +1,50 @@
+{
+  "name": "rentctl",
+  "description": "Leased dev environments for AI coding sessions — a dev server can never outlive the work that needed it.",
+  "author": {
+    "name": "Michael Drake"
+  },
+  "repository": "https://github.com/Michael-Drake/rentctl",
+  "license": "Apache-2.0",
+  "keywords": [
+    "dev-server",
+    "lease",
+    "cleanup",
+    "mcp",
+    "ports"
+  ],
+  "hooks": {
+    "hooks": {
+      "SessionEnd": [
+        {
+          "matcher": "*",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "rent down --all --cwd \"$CLAUDE_PROJECT_DIR\" --reason session-end",
+              "timeout": 30
+            }
+          ]
+        }
+      ],
+      "SessionStart": [
+        {
+          "matcher": "startup",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "rent sweep",
+              "timeout": 30
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "mcpServers": {
+    "rentctl": {
+      "command": "rent-mcp",
+      "args": []
+    }
+  }
+}

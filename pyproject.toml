@@ -1,0 +1,97 @@
+[project]
+# Distribution and import package are both `rentctl` as of the repo split (ADR-0009 §3).
+# The deliberate divergence that used to live here is resolved: PyPI `devctl` is a
+# different live project, so shipping an import package by that name would have put two
+# unrelated projects in one import namespace for anyone who installed both.
+name = "rentctl"
+version = "1.0.0"
+description = "Leased dev environments for AI coding sessions — a dev server can never outlive the work that needed it. MCP server + CLI."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+# Name only, no email, deliberately (project owner's call). The name is already public
+# on every commit once the repo is; a PyPI `author-email` is separately harvested,
+# so omitting it costs nothing and avoids that. Not a placeholder — do not "complete" it.
+authors = [{ name = "Michael Drake" }]
+keywords = ["mcp", "dev-server", "process-management", "ai-agents", "cli"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    # Named explicitly rather than left off: POSIX process-group teardown is the
+    # safety-critical mechanism and has no tested Windows equivalent, so the
+    # metadata must not imply a portability the README disclaims.
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Testing",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    # Upper-bounded deliberately. mcp 2.0.0 removed `mcp.server.fastmcp`, which
+    # `mcp_server.py` imports, so an unbounded `>=1.2.0` resolved to a version
+    # where rentctl's MCP server fails at *import* — invisible here because the
+    # installed tool venv still held 1.28.1, and fatal for anyone installing
+    # fresh. Port to the 2.x API deliberately, then raise this.
+    "mcp>=1.2.0,<2",
+    "psutil>=6.0.0",
+]
+
+[project.urls]
+# `Michael-Drake` is the canonical casing per the GitHub API's own `login` field
+# (it resolves the name case-insensitively, which is why a wrong case would work
+# and therefore never get corrected). Keep in step with `wiring.py`.
+Homepage = "https://github.com/Michael-Drake/rentctl"
+Repository = "https://github.com/Michael-Drake/rentctl"
+Changelog = "https://github.com/Michael-Drake/rentctl/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[project.scripts]
+# `rent` is the command. The `devctl-*` names are kept as aliases and are NOT dead
+# weight: projects enrolled before the rename have `devctl` baked into committed
+# hooks and .mcp.json files, and cutting the aliases would break exactly the
+# cleanup those hooks perform. They go away once enrolled projects have migrated.
+rent = "rentctl.cli:main"
+rent-watchdog = "rentctl.watchdog:main"
+rent-mcp = "rentctl.mcp_server:main"
+devctl = "rentctl.cli:main"
+devctl-watchdog = "rentctl.watchdog:main"
+devctl-mcp = "rentctl.mcp_server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rentctl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# src-layout: put src/ on sys.path so the suite runs against a bare checkout with no
+# editable install. The session-end merge gate runs the tests in a throwaway worktree
+# (ADR-0058 D4) where no install exists, so this is what makes the gate runnable at all.
+pythonpath = ["src"]
+markers = [
+    "integration: spawns real processes and touches tmp state dirs (deselect with -m 'not integration')",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["rentctl.core"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]
