@@ -140,7 +140,12 @@ def integ(devctl_home, write_registry, tmp_path):
 
 def test_up_creates_answering_env(integ):
     res = integ.svc.env_up("demo", cwd=integ.cwd)
-    assert res["ok"] is True
+    # Carry `res` into the failure message. `env_up` already puts the reason and
+    # the server's own log tail in there, and a bare `assert res["ok"] is True`
+    # throws all of it away -- which is how nine red integration tests on the
+    # macOS runner said nothing at all about why. The first release attempt was
+    # diagnosed from an ephemeral port number in an unrelated traceback.
+    assert res["ok"] is True, f"env_up failed on port {integ.port}: {res}"
     assert res["port"] == integ.port
     assert res["already_running"] is False
     lease = Lease.read(integ.lease)
