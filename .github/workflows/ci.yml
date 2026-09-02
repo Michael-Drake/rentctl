@@ -34,6 +34,19 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
+        with:
+          # WITHOUT this the matrix is decorative. `setup-uv` installs uv but
+          # pins no interpreter, so `uv run` takes whatever the runner already
+          # has: the first release run put CPython 3.12.3 on BOTH ubuntu legs
+          # and 3.14.6 on BOTH macOS legs. Four jobs, two configurations, and
+          # a gate reporting a coverage of Python versions it never tested.
+          python-version: ${{ matrix.python-version }}
+
+      - name: Report the interpreter actually in use
+        # The matrix label is a promise; this is the receipt. A leg named 3.13
+        # that runs 3.12 must say so in its own log rather than be inferred
+        # later from a traceback path.
+        run: uv run python -c "import sys; print('interpreter:', sys.version)"
 
       - name: Run the suite
         # -rs surfaces skips. A skipped test reports identically to a passing

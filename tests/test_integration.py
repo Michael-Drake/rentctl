@@ -105,7 +105,16 @@ def integ(devctl_home, write_registry, tmp_path):
     svc = Service(
         devctl_home,
         runner_factory=fast_runner,
-        readiness_timeout=10.0,
+        # Deliberately ABOVE the product default of 30s, not below it. At 10s
+        # this fixture was stricter than anything rentctl ships, and it failed
+        # nine integration tests on GitHub's macOS runners -- not from a bug,
+        # but because `python -m http.server` could not finish booting in time
+        # on a host that needs ~2.2s to start Python for a one-line script.
+        # The evidence was START_TIMEOUT with an EMPTY log_tail and a process
+        # still alive: nothing had crashed, it simply had not bound yet.
+        # No test asserts on the timeout path, so the only cost of a generous
+        # value is wall-clock on a genuine failure.
+        readiness_timeout=60.0,
         watchdog_spawn=lambda p: None,  # tests that need a real watchdog spawn their own
         session_id_fn=lambda: "itest",
     )
@@ -140,7 +149,12 @@ def integ(devctl_home, write_registry, tmp_path):
 
 def test_up_creates_answering_env(integ):
     res = integ.svc.env_up("demo", cwd=integ.cwd)
-    assert res["ok"] is True
+    # Carry `res` into the failure message. `env_up` already puts the reason and
+    # the server's own log tail in there, and a bare `assert res["ok"] is True`
+    # throws all of it away -- which is how nine red integration tests on the
+    # macOS runner said nothing at all about why. The first release attempt was
+    # diagnosed from an ephemeral port number in an unrelated traceback.
+    assert res["ok"] is True, f"env_up failed on port {integ.port}: {res}"
     assert res["port"] == integ.port
     assert res["already_running"] is False
     lease = Lease.read(integ.lease)
