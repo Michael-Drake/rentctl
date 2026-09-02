@@ -105,7 +105,16 @@ def integ(devctl_home, write_registry, tmp_path):
     svc = Service(
         devctl_home,
         runner_factory=fast_runner,
-        readiness_timeout=10.0,
+        # Deliberately ABOVE the product default of 30s, not below it. At 10s
+        # this fixture was stricter than anything rentctl ships, and it failed
+        # nine integration tests on GitHub's macOS runners -- not from a bug,
+        # but because `python -m http.server` could not finish booting in time
+        # on a host that needs ~2.2s to start Python for a one-line script.
+        # The evidence was START_TIMEOUT with an EMPTY log_tail and a process
+        # still alive: nothing had crashed, it simply had not bound yet.
+        # No test asserts on the timeout path, so the only cost of a generous
+        # value is wall-clock on a genuine failure.
+        readiness_timeout=60.0,
         watchdog_spawn=lambda p: None,  # tests that need a real watchdog spawn their own
         session_id_fn=lambda: "itest",
     )
