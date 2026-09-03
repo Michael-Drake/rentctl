@@ -6,7 +6,58 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: semver. Patch and minor are derived from the impact of what shipped;
 a major is **declared** by a human rather than computed.
 
-## [1.0.0] — unreleased
+## [Unreleased]
+
+Nothing staged.
+
+## [1.0.1] — 2026-09-03
+
+**The release 1.0.0 needed.** Two of these are defects in artifacts 1.0.0 already
+published — a plugin that installed no cleanup, and no route to install it by any
+command — and one is the precondition for the MCP registry listing, which cannot be
+published against 1.0.0 because the registry proves package ownership by grepping the
+*published* README for a marker that release does not carry.
+
+### Fixed
+
+- **The Claude Code plugin installed no hooks at all.** Its manifest wrapped the hook
+  events in the *settings-file* envelope (`{"hooks": {"SessionEnd": …}}`) instead of
+  emitting the event map directly. Claude Code read the outer key as an event name,
+  matched nothing, and ignored every entry at runtime — so the plugin delivered the MCP
+  server and no cleanup, while listing as installed. Since installing the cleanup hooks
+  is the entire reason the plugin channel exists, 1.0.0's plugin was the half of the
+  product it was meant to complete. Found by running `claude plugin validate`, which
+  names it exactly.
+- **The plugin could not be installed by anyone.** The published repo carried
+  `plugin/.claude-plugin/plugin.json` but no marketplace manifest at its root, and
+  `claude plugin marketplace add` reads the root. There was no route to the plugin by
+  any command.
+- **`plugin_installed()` always answered "absent."** It checked
+  `~/.claude/plugins/<name>`, which Claude Code never creates — installs are recorded in
+  `installed_plugins.json` and unpacked under `cache/<marketplace>/<plugin>/<version>`.
+  It now reads that register, and it respects install scope: a project-scoped install no
+  longer counts as coverage for a *different* project, which would have made `rent init`
+  skip writing hooks that nothing else was going to supply.
+
+### Added
+
+- **A marketplace manifest** at `.claude-plugin/marketplace.json`, rendered from the same
+  module as the plugin manifest, so the listing and the plugin it lists cannot describe
+  different things.
+- **`server.json`** — the MCP registry entry, generated so its version can never drift
+  from the version actually on PyPI.
+- **Trusted Publishing** (`.github/workflows/release.yml`): tagged releases upload to
+  PyPI over OIDC, with no API token held anywhere.
+- **"Development machines only"** in the README's security section. A default install is
+  advisory and only scans enrolled port blocks; strict enforcement is not for a host
+  serving traffic.
+
+### Changed
+
+- The package summary now leads with the guarantee rather than the mechanism, matching
+  the repository description.
+
+## [1.0.0] — 2026-09-02
 
 **The first public release.** Version declared by the project owner rather than
 computed: `1.0.0` is what ships when `rentctl` becomes public, on the reasoning that a

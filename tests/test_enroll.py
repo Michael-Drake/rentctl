@@ -375,8 +375,10 @@ def test_sync_declined_leaves_the_old_pin(repo, devctl_home):
 # --- plugin path (ADR-0002 §5) --------------------------------------------
 
 def test_plugin_present_means_init_skips_hook_writing(repo, devctl_home, tmp_path):
+    from conftest import install_plugin
+
     claude_home = tmp_path / "claude"
-    (claude_home / "plugins" / "devctl").mkdir(parents=True)
+    install_plugin(claude_home)
     root = repo()
     result = run(root, devctl_home, claude_home=claude_home)
     assert result["plugin"] is True

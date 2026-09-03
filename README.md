@@ -1,5 +1,7 @@
 # rentctl
 
+<!-- mcp-name: io.github.Michael-Drake/rentctl -->
+
 **A dev server should never outlive the work that needed it.**
 
 `rentctl` *rents* dev environments to your AI coding sessions. Every environment is a
@@ -144,6 +146,20 @@ Consequences worth being explicit about:
 - **`rentctl` only manages what you enrolled.** Test-framework servers (pytest fixtures,
   Playwright's `webServer`) own their own lifecycle and use ephemeral ports; `rentctl`
   never touches them.
+
+### Development machines only
+
+**Install this on machines where dev servers are meant to be disposable.** Not on a
+host running anything you would mind losing.
+
+A default install is safe: enforcement is **advisory** everywhere, and `rentctl` only
+scans the port blocks of projects you enrolled. Nothing else on the machine is examined
+and nothing unenrolled is ever signalled.
+
+But `rentctl`'s whole job is killing processes that outlive a session, and strict
+enforcement exists to make that unavoidable. A tool built to reap servers you forgot
+about is the wrong tool to arm on a host serving traffic — there, the servers outliving
+their session are *supposed* to. Keep it on development machines.
 
 ## Known gaps
 

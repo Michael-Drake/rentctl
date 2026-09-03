@@ -48,14 +48,19 @@ jobs:
         # later from a traceback path.
         run: uv run python -c "import sys; print('interpreter:', sys.version)"
 
-      - name: Run the suite
-        # -rs surfaces skips. A skipped test reports identically to a passing
-        # one in default output, which is how the Linux gap above stayed
-        # invisible; if something skips here we want to see which.
-        run: uv run --extra dev pytest -q -rs
-
-      - name: Check core/ coverage
-        # core/ is the release gate at >= 90% (spec §10). The runners, CLI and
-        # MCP shell are thin wrappers over it and are covered by the
-        # integration tests rather than this number.
-        run: uv run --extra dev pytest -q --cov --cov-fail-under=90
+      - name: Run the suite, with the core/ coverage gate
+        # ONE run. This was two steps — the suite, then the same suite again under
+        # coverage — which is a rounding error on Linux and eight wasted minutes on
+        # macOS. GitHub's hosted macOS runners take 484s for a suite that takes 15s
+        # on a real Mac, so the duplicate cost more wall-clock than every other step
+        # in this workflow combined. The coverage gate needs the suite to run; it
+        # never needed it to run twice.
+        #
+        # -rs surfaces skips. A skipped test reports identically to a passing one in
+        # default output, which is how the Linux gap above stayed invisible; if
+        # something skips here we want to see which.
+        #
+        # core/ is the release gate at >= 90% (spec §10). The runners, CLI and MCP
+        # shell are thin wrappers over it and are covered by the integration tests
+        # rather than this number.
+        run: uv run --extra dev pytest -q -rs --cov --cov-fail-under=90

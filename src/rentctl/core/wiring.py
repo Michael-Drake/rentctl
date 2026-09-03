@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .. import __version__
 from .runtimes import CLAUDE_CODE, HOOK_TIMEOUT, RuntimeBinding
 
 # The MCP server map key and the server's advertised identity (ADR-0009, WI-0017).
@@ -157,15 +158,28 @@ def plugin_manifest() -> dict[str, Any]:
     either; inlining keeps the whole plugin one generated artifact, so there is
     no second file that can be regenerated out of step with the first.
 
-    ``version`` is deliberately absent. Only ``name`` is required, and rentctl's
-    version is an open decision (WI-0023) — emitting a number here would mint a
-    version claim from a build script rather than a release.
+    **``hooks`` takes the event map directly** — ``{"SessionEnd": [...]}``, not
+    ``{"hooks": {"SessionEnd": [...]}}``. The wrapped form is the *settings file*
+    shape (:func:`render_hooks_text`), and reusing it here shipped in 1.0.0 as a
+    real defect: `claude plugin validate` reports ``hooks.hooks: unknown hook
+    event; entry ignored at runtime``, so the published plugin installed **no
+    cleanup at all** — the exact half-a-product failure this manifest exists to
+    prevent, wearing the face of a working install. The two shapes differ by one
+    level of nesting and nothing else, which is why the fragment being correct
+    was not enough to make the manifest correct.
+
+    ``version`` tracks the package version. It was deliberately absent while
+    rentctl had no released version (WI-0023); 1.0.0 settled that, and a plugin
+    that declares no version cannot be updated by someone who already has it.
+    Read from ``rentctl.__version__`` rather than restated, so a release cannot
+    bump one and leave the other behind.
     """
     return {
         "name": SERVER_NAME,
+        "version": __version__,
         "description": (
-            "Leased dev environments for AI coding sessions — a dev server can never "
-            "outlive the work that needed it."
+            "Leased dev environments for AI coding sessions — every server dies "
+            "when its session ends, so none are left running rogue."
         ),
         "author": {"name": "Michael Drake"},
         # `Michael-Drake` IS the canonical casing — verified against the GitHub
@@ -176,7 +190,7 @@ def plugin_manifest() -> dict[str, Any]:
         "repository": "https://github.com/Michael-Drake/rentctl",
         "license": "Apache-2.0",
         "keywords": ["dev-server", "lease", "cleanup", "mcp", "ports"],
-        "hooks": {"hooks": hooks_fragment(CLAUDE_CODE)},
+        "hooks": hooks_fragment(CLAUDE_CODE),
         "mcpServers": {SERVER_NAME: mcp_fragment()},
     }
 
@@ -190,6 +204,118 @@ def render_plugin_manifest() -> str:
     the field a user reads to decide whether to install this.
     """
     return json.dumps(plugin_manifest(), indent=2, ensure_ascii=False) + "\n"
+
+
+# The marketplace entry point. `plugin.json` describes the plugin; this is what
+# makes it *reachable* — `claude plugin marketplace add Michael-Drake/rentctl`
+# reads this file at the repo root, and without it there is no route to install
+# by. 1.0.0 shipped `plugin/` with no marketplace manifest, so the plugin was
+# uninstallable by anyone: the manifest was correct about a plugin nobody could
+# get. Schema read from code.claude.com/docs/en/plugin-marketplaces.
+MARKETPLACE_NAME = SERVER_NAME
+
+# Where the plugin sits relative to the repo root. One plugin, so it is spelled
+# here rather than via `metadata.pluginRoot`, which only pays off for several.
+PLUGIN_SOURCE = "./plugin"
+
+
+def marketplace_manifest() -> dict[str, Any]:
+    """The marketplace manifest for ``.claude-plugin/marketplace.json``.
+
+    Rendered from :func:`plugin_manifest` for the name and description, for the
+    same reason the plugin manifest is rendered from :func:`hooks_fragment`: a
+    marketplace listing that drifts from the plugin it lists describes something
+    other than what gets installed.
+    """
+    plugin = plugin_manifest()
+    return {
+        "name": MARKETPLACE_NAME,
+        "owner": {"name": "Michael Drake", "url": "https://github.com/Michael-Drake"},
+        "description": (
+            "The rentctl plugin — the MCP server plus the session hooks that tear "
+            "leased dev environments down when the session ends."
+        ),
+        "plugins": [
+            {
+                "name": plugin["name"],
+                "source": PLUGIN_SOURCE,
+                "description": plugin["description"],
+            }
+        ],
+    }
+
+
+def render_marketplace_manifest() -> str:
+    """The marketplace manifest as bytes. ``ensure_ascii=False`` per :func:`render_plugin_manifest`."""
+    return json.dumps(marketplace_manifest(), indent=2, ensure_ascii=False) + "\n"
+
+
+# --- the MCP registry entry (WI-0009) -------------------------------------
+
+# The registry's namespace for a GitHub-authenticated publisher. `io.github.<login>/`
+# is not decoration — the registry authenticates the publisher as that GitHub account
+# and refuses any name outside the namespace it owns.
+REGISTRY_NAME = f"io.github.Michael-Drake/{SERVER_NAME}"
+
+# Schema the entry is validated against. Pinned, not "latest": the registry is in
+# preview and says so, and an entry that silently re-validates against a moved
+# schema fails at publish time rather than in the suite.
+REGISTRY_SCHEMA = "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json"
+
+# The token the registry greps for in the PUBLISHED PyPI README to prove we own
+# the package. It is checked against the artifact on PyPI, not against this repo,
+# so it has to be inside the README that ships — which means a release carries it
+# or the registry publish is refused. 1.0.0 has no marker, so the registry entry
+# cannot be published against it at all; it waits for the next release.
+MCP_NAME_MARKER = f"mcp-name: {REGISTRY_NAME}"
+
+# The registry caps descriptions at 100 characters and rejects the entry outright
+# past it (HTTP 422). Every other surface takes the longer sentence, so this is a
+# separate string rather than a truncation — a description cut mid-clause reads as
+# a bug in the listing.
+REGISTRY_DESCRIPTION_LIMIT = 100
+REGISTRY_DESCRIPTION = "Leased dev environments — every server dies when its AI session ends."
+
+
+def registry_manifest() -> dict[str, Any]:
+    """The MCP registry entry for ``server.json``.
+
+    Generated for the version fields above all: the entry's ``version`` and its
+    package ``version`` must both equal the version actually on PyPI, and a
+    hand-kept file drifts at every single release. That is the same class of
+    defect as a hand-copied plugin manifest, with a worse failure — the registry
+    would advertise a version of rentctl that nobody can install.
+
+    ``runtimeHint`` is ``uvx`` because the console script (``rent-mcp``) is not
+    the distribution name (``rentctl``); a client assuming they match runs
+    nothing. The explicit ``--from`` spelling is what makes the two names
+    unambiguous to whatever resolves it.
+    """
+    return {
+        "$schema": REGISTRY_SCHEMA,
+        "name": REGISTRY_NAME,
+        "description": REGISTRY_DESCRIPTION,
+        "repository": {"url": "https://github.com/Michael-Drake/rentctl", "source": "github"},
+        "version": __version__,
+        "packages": [
+            {
+                "registryType": "pypi",
+                "identifier": SERVER_NAME,
+                "version": __version__,
+                "runtimeHint": "uvx",
+                "transport": {"type": "stdio"},
+                "packageArguments": [
+                    {"type": "named", "name": "--from", "value": SERVER_NAME},
+                    {"type": "positional", "value": f"{COMMAND}-mcp"},
+                ],
+            }
+        ],
+    }
+
+
+def render_registry_manifest() -> str:
+    """The registry entry as bytes. ``ensure_ascii=False`` per :func:`render_plugin_manifest`."""
+    return json.dumps(registry_manifest(), indent=2, ensure_ascii=False) + "\n"
 
 
 def render_hooks_text(binding: RuntimeBinding = CLAUDE_CODE) -> str:
@@ -593,19 +719,64 @@ def install_rule(path: Path) -> bool:
 
 # --- plugin detection (ADR-0002 §5) ---------------------------------------
 
-def plugin_installed(claude_home: Path | None = None) -> bool:
-    """Whether our Claude Code plugin is installed for this user, under either name.
+# The register Claude Code actually keeps installs in (WI-0028). Verified by
+# installing the plugin and reading what appeared, not from documentation:
+#
+#   {"version": 2, "plugins": {"rentctl@rentctl": [{"scope": "local",
+#    "projectPath": "/…", "installPath": "…/cache/rentctl/rentctl/1.0.0", …}]}}
+#
+# The old check tested `~/.claude/plugins/<name>`, which never exists — that
+# directory holds `cache/`, `marketplaces/` and this file, and installs land at
+# `cache/<marketplace>/<plugin>/<version>`. So it answered "absent" always. It
+# survived a month because absent is the FAIL-SAFE direction: `init` then writes
+# the hooks itself and `install_hooks` is idempotent, so nothing broke.
+INSTALLED_PLUGINS_FILE = "installed_plugins.json"
 
-    **Provisional.** The plugin does not exist yet (ADR-0002 downstream item 1),
-    so this checks the conventional install location and nothing more. When the
-    plugin ships with a real manifest, this becomes a manifest read — the call
-    sites do not change, which is why the check is a function rather than an
-    inline path test.
+# Scopes that apply everywhere. `local` and `project` installs carry a
+# `projectPath` and apply only there, so they are matched against the project
+# being enrolled rather than counted outright.
+_GLOBAL_SCOPES = frozenset({"user"})
 
-    Defaults to absent, which is the safe direction: `init` writes the hooks
-    itself, and a duplicate is prevented by :func:`install_hooks` idempotence
-    rather than by this guess being right.
+
+def plugin_installed(claude_home: Path | None = None, project_root: Path | None = None) -> bool:
+    """Whether our Claude Code plugin is installed and active for this project.
+
+    Read from Claude Code's own install register (:data:`INSTALLED_PLUGINS_FILE`)
+    rather than guessed from a path. Keys are ``<plugin>@<marketplace>``, so the
+    marketplace a user installed from does not matter — only the plugin name,
+    under either spelling (ADR-0009 §4).
+
+    **Scope is load-bearing, not a detail.** A `local`/`project` install applies
+    to one project. Counting it everywhere would make `init` skip writing hooks
+    for a *different* project on the strength of an install that does not cover
+    it — leaving that project with no cleanup at all, which is the exact
+    false-positive the previous docstring named as the thing to avoid. Without a
+    `project_root` to compare against, only user-scope installs count.
+
+    Returns False on anything unreadable — missing file, bad JSON, unexpected
+    shape. `init` then writes the hooks itself and :func:`install_hooks`
+    idempotence prevents the duplicate, so being wrong in this direction costs a
+    redundant hook entry; being wrong in the other costs the cleanup.
     """
     home = Path(claude_home) if claude_home is not None else Path.home() / ".claude"
-    plugins = home / "plugins"
-    return (plugins / SERVER_NAME).is_dir() or (plugins / LEGACY_SERVER_NAME).is_dir()
+    try:
+        data = json.loads((home / "plugins" / INSTALLED_PLUGINS_FILE).read_text())
+        entries = data["plugins"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if not isinstance(entries, dict):
+        return False
+
+    root = Path(project_root).resolve() if project_root is not None else None
+    for key, installs in entries.items():
+        if key.split("@", 1)[0] not in (SERVER_NAME, LEGACY_SERVER_NAME):
+            continue
+        for install in installs if isinstance(installs, list) else []:
+            if not isinstance(install, dict):
+                continue
+            if install.get("scope") in _GLOBAL_SCOPES:
+                return True
+            path = install.get("projectPath")
+            if root is not None and path and Path(path).resolve() == root:
+                return True
+    return False

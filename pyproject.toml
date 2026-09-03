@@ -4,8 +4,21 @@
 # different live project, so shipping an import package by that name would have put two
 # unrelated projects in one import namespace for anyone who installed both.
 name = "rentctl"
-version = "1.0.0"
-description = "Leased dev environments for AI coding sessions — a dev server can never outlive the work that needed it. MCP server + CLI."
+# DERIVED, not typed. The version has exactly one home: `__version__` in
+# `src/rentctl/__init__.py`, which hatchling reads at build time (see
+# `[tool.hatch.version]`). It used to be typed here as well, in two files with
+# nothing tying them together and no test comparing them — a mismatch would have
+# published a package whose `rent --version` disagreed with its own metadata.
+#
+# The source is the module rather than this file, and that direction matters:
+# `core/wiring.py` imports `__version__` to stamp the plugin, marketplace and
+# registry manifests, and it does that from the SOURCE TREE at render time. Were
+# the arrow reversed — this file authoritative, the module reading installed
+# metadata — regenerating manifests on a machine with a stale `rentctl` installed
+# would silently stamp the old version into all three. One literal, read the same
+# way by the build and by the code, cannot drift.
+dynamic = ["version"]
+description = "Leased dev environments for AI coding sessions — every server dies when its session ends, so none are left running rogue. MCP server + CLI."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
@@ -52,6 +65,12 @@ Changelog = "https://github.com/Michael-Drake/rentctl/blob/main/CHANGELOG.md"
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
+    # The build backend, as a TEST dependency. `test_the_built_metadata_version_
+    # matches_the_module` runs hatchling's own version hook rather than re-parsing
+    # `__init__.py` with a second regex, so it checks what the build will actually
+    # extract. Without this it degrades to a permanent skip — which reports
+    # identically to a pass and is how the plugin-hooks defect survived 1.0.0.
+    "hatchling>=1.0",
 ]
 
 [project.scripts]
@@ -69,6 +88,12 @@ devctl-mcp = "rentctl.mcp_server:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+# The single source of the version, for the build side. `core/wiring.py` reads the
+# same literal directly for the manifests, so the package metadata and the three
+# generated manifests cannot disagree about what version this is.
+path = "src/rentctl/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rentctl"]

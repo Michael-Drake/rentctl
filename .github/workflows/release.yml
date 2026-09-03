@@ -1,0 +1,114 @@
+# Publish rentctl to PyPI via Trusted Publishing (OIDC) — no API token anywhere.
+#
+# SOURCE FILE — like `ci.yml`, this is not wired to anything in the private repo.
+# `publish.py` copies it to `.github/workflows/release.yml` in the published tree.
+#
+# WHY THIS EXISTS. 1.0.0 was uploaded with a long-lived PyPI API token held on a
+# developer machine. A token is a bearer credential: it can be copied, it can be
+# leaked in a shell history or a CI log, and it has to be rotated by a human who
+# remembers to. Trusted Publishing replaces it with a short-lived OIDC token that
+# GitHub mints for THIS repository, THIS workflow, and THIS environment, and that
+# PyPI verifies before accepting the upload. There is nothing left to leak.
+#
+# DELIBERATELY DEFERRED FROM 1.0.0. It required adding an untested workflow to a
+# byte-verified artifact and exercising an unrepeatable action (an upload of a
+# version number that can never be reused) on release night. The cost of getting
+# it wrong now is a patch version; then it was the version number.
+#
+# ONE-TIME SETUP ON PyPI, and it must be done BEFORE the first run — the workflow
+# cannot create it. On https://pypi.org/manage/project/rentctl/settings/publishing/
+# add a GitHub publisher:
+#
+#     Owner:            Michael-Drake
+#     Repository:       rentctl
+#     Workflow name:    release.yml
+#     Environment name: pypi
+#
+# All four must match this file exactly. PyPI checks them against the OIDC claim,
+# so a mismatch is rejected at upload with a permission error rather than a
+# helpful one.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  # The gate. The tag being pushed does not mean the tag is good, and an upload
+  # cannot be taken back — so the suite runs against the tagged commit before
+  # anything is built, on the same four legs CI uses.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The receipt. `setup-uv` pinning no interpreter is what made the first
+      # release's matrix decorative — four jobs, two configurations. Printing the
+      # interpreter means the leg's label carries evidence rather than a claim.
+      - name: Show the interpreter actually in use
+        run: uv run python -c "import sys; print(sys.version)"
+
+      - name: Test
+        run: uv run --extra dev pytest -q
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      # twine's metadata check, not an upload. Catches a malformed long_description
+      # before the irreversible step rather than after.
+      - name: Check the artifacts
+        run: uvx twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+
+    # Names the environment PyPI's trusted publisher is bound to. It is part of
+    # what PyPI verifies, so it is not cosmetic — and it is also where a required
+    # reviewer can be attached if this should ever pause for a human.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/rentctl
+
+    # `id-token: write` is what lets GitHub mint the OIDC token. Without it the
+    # upload falls back to looking for a password and fails. Nothing else is
+    # granted: this job needs no repository write access at all.
+    permissions:
+      id-token: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # No `password:` — that absence IS the feature.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

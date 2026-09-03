@@ -8,10 +8,12 @@ breaks the project it was meant to enroll.
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
 
+import rentctl
 from rentctl.core import runtimes, wiring
 
 
@@ -480,8 +482,22 @@ def test_the_checked_in_manifest_matches_what_wiring_renders():
 
 def test_the_manifest_hooks_are_the_same_object_init_writes():
     manifest = wiring.plugin_manifest()
-    assert manifest["hooks"]["hooks"] == wiring.hooks_fragment()
+    assert manifest["hooks"] == wiring.hooks_fragment()
     assert manifest["mcpServers"][wiring.SERVER_NAME] == wiring.mcp_fragment()
+
+
+def test_the_manifest_hooks_are_not_wrapped_in_a_settings_file_envelope():
+    """The defect that shipped in 1.0.0. `hooks` here is the event map itself;
+    the `{"hooks": {...}}` envelope is the *settings file* shape. Wrapped, Claude
+    Code reads `hooks` as the event name, matches nothing, and ignores every entry
+    at runtime — so the plugin installs no cleanup while looking installed. That
+    is the one failure mode the plugin channel exists to remove.
+
+    Asserted on the KEYS rather than the nesting, so any future envelope fails
+    too: every key here must be a real hook event."""
+    hooks = wiring.plugin_manifest()["hooks"]
+    assert "hooks" not in hooks
+    assert set(hooks) == {"SessionEnd", "SessionStart"}
 
 
 def test_the_manifest_carries_the_only_required_field():
@@ -489,10 +505,91 @@ def test_the_manifest_carries_the_only_required_field():
     assert wiring.plugin_manifest()["name"] == wiring.SERVER_NAME
 
 
-def test_the_manifest_declares_no_version():
-    """rentctl's version is an open decision (WI-0023). A build script must not
-    mint a version claim ahead of a release record."""
-    assert "version" not in wiring.plugin_manifest()
+def test_the_manifest_version_tracks_the_package():
+    """Absent while rentctl had no release (WI-0023); 1.0.0 settled that. Read
+    from the package so a version bump cannot update one and miss the other —
+    a plugin declaring no version cannot be updated by someone who has it."""
+    assert wiring.plugin_manifest()["version"] == rentctl.__version__
+
+
+MARKETPLACE_PATH = Path(__file__).resolve().parent.parent / ".claude-plugin" / "marketplace.json"
+
+
+def test_the_checked_in_marketplace_matches_what_wiring_renders():
+    assert MARKETPLACE_PATH.read_text() == wiring.render_marketplace_manifest()
+
+
+def test_the_marketplace_lists_the_plugin_it_ships():
+    """1.0.0 shipped `plugin/` with no marketplace manifest, so there was no route
+    to install it by — a correct plugin nobody could reach. This is that route,
+    and the listing is rendered from the plugin manifest so the two cannot
+    describe different things."""
+    market = wiring.marketplace_manifest()
+    plugin = wiring.plugin_manifest()
+    (entry,) = market["plugins"]
+    assert entry["name"] == plugin["name"]
+    assert entry["description"] == plugin["description"]
+    assert entry["source"] == wiring.PLUGIN_SOURCE
+
+
+def test_the_marketplace_source_points_at_a_real_plugin():
+    """The source is a path relative to the repo root, and a typo in it is
+    invisible until someone tries to install."""
+    root = MARKETPLACE_PATH.parent.parent
+    source = wiring.marketplace_manifest()["plugins"][0]["source"]
+    assert (root / source / ".claude-plugin" / "plugin.json").is_file()
+
+
+# --- the MCP registry entry (WI-0009) -------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SERVER_JSON_PATH = REPO_ROOT / "server.json"
+PUBLIC_README = REPO_ROOT / "README-public.md"
+
+
+def test_the_checked_in_server_json_matches_what_wiring_renders():
+    assert SERVER_JSON_PATH.read_text() == wiring.render_registry_manifest()
+
+
+def test_the_registry_versions_track_the_package():
+    """Both must equal what is actually on PyPI. A hand-kept server.json drifts
+    at every release and the registry then advertises a version nobody can
+    install."""
+    entry = wiring.registry_manifest()
+    assert entry["version"] == rentctl.__version__
+    assert entry["packages"][0]["version"] == rentctl.__version__
+    assert entry["packages"][0]["identifier"] == wiring.SERVER_NAME
+
+
+def test_the_registry_description_fits_the_registry_limit():
+    """The registry rejects a longer description with HTTP 422 — found by
+    validating rather than by reading a schema, which does not state the cap."""
+    assert len(wiring.REGISTRY_DESCRIPTION) <= wiring.REGISTRY_DESCRIPTION_LIMIT
+
+
+def test_the_published_readme_carries_the_ownership_marker():
+    """How the registry proves we own the PyPI package: it greps the PUBLISHED
+    README for this token. It is checked against the artifact on PyPI, not this
+    repo, so a release that drops it makes the registry publish fail with nothing
+    in the repo looking wrong. 1.0.0 shipped without it, which is why the registry
+    entry could not be published against 1.0.0 at all."""
+    assert wiring.MCP_NAME_MARKER in PUBLIC_README.read_text()
+
+
+def test_the_marker_names_the_server_it_publishes():
+    assert wiring.REGISTRY_NAME in wiring.MCP_NAME_MARKER
+    assert wiring.registry_manifest()["name"] == wiring.REGISTRY_NAME
+
+
+def test_the_registry_entry_names_the_console_script_not_the_distribution():
+    """`rent-mcp` is the executable; `rentctl` is the distribution. A client that
+    assumes they match runs nothing, which is why runtimeHint and the explicit
+    --from spelling are both present."""
+    package = wiring.registry_manifest()["packages"][0]
+    args = package["packageArguments"]
+    assert package["runtimeHint"] == "uvx"
+    assert {"type": "named", "name": "--from", "value": wiring.SERVER_NAME} in args
+    assert {"type": "positional", "value": f"{wiring.COMMAND}-mcp"} in args
 
 
 def test_the_manifest_keeps_non_ascii_readable():
@@ -505,17 +602,118 @@ def test_the_manifest_keeps_non_ascii_readable():
 
 # --- plugin detection (ADR-0002 §5) ---------------------------------------
 
+def write_register(claude_home, plugins):
+    """Claude Code's install register, in the shape observed on disk after a real
+    `claude plugin install` (WI-0028) — not a shape invented for the test."""
+    d = claude_home / "plugins"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / wiring.INSTALLED_PLUGINS_FILE).write_text(
+        json.dumps({"version": 2, "plugins": plugins})
+    )
+
+
 def test_plugin_absent_by_default(tmp_path):
     assert wiring.plugin_installed(tmp_path) is False
 
 
-def test_plugin_detected_when_marker_present(tmp_path):
-    (tmp_path / "plugins" / "rentctl").mkdir(parents=True)
+def test_plugin_absent_when_the_register_is_unreadable(tmp_path):
+    """Absent is the fail-safe answer: init writes the hooks itself and
+    install_hooks is idempotent. A false POSITIVE leaves a project with none."""
+    (tmp_path / "plugins").mkdir(parents=True)
+    (tmp_path / "plugins" / wiring.INSTALLED_PLUGINS_FILE).write_text("{not json")
+    assert wiring.plugin_installed(tmp_path) is False
+
+
+def test_plugin_detected_at_user_scope(tmp_path):
+    write_register(tmp_path, {"rentctl@rentctl": [{"scope": "user"}]})
     assert wiring.plugin_installed(tmp_path) is True
 
 
 def test_plugin_detected_under_the_legacy_name(tmp_path):
     """A plugin installed before the rename still counts — missing it makes init
     write hooks the plugin already supplies."""
-    (tmp_path / "plugins" / "devctl").mkdir(parents=True)
+    write_register(tmp_path, {"devctl@devctl": [{"scope": "user"}]})
     assert wiring.plugin_installed(tmp_path) is True
+
+
+def test_plugin_detected_from_any_marketplace(tmp_path):
+    """The key is `<plugin>@<marketplace>`. Where someone installed it from is
+    not our business; the plugin name is."""
+    write_register(tmp_path, {"rentctl@somebody-elses-list": [{"scope": "user"}]})
+    assert wiring.plugin_installed(tmp_path) is True
+
+
+def test_a_local_install_counts_only_for_its_own_project(tmp_path):
+    """The false positive that matters. A local-scope install supplies hooks to
+    ONE project; counting it elsewhere makes init skip writing hooks for a
+    project the plugin does not cover, leaving it with no cleanup at all."""
+    mine, theirs = tmp_path / "mine", tmp_path / "theirs"
+    mine.mkdir()
+    theirs.mkdir()
+    write_register(tmp_path, {"rentctl@rentctl": [{"scope": "local", "projectPath": str(mine)}]})
+    assert wiring.plugin_installed(tmp_path, mine) is True
+    assert wiring.plugin_installed(tmp_path, theirs) is False
+
+
+def test_a_local_install_does_not_count_with_no_project_to_compare(tmp_path):
+    write_register(tmp_path, {"rentctl@rentctl": [{"scope": "local", "projectPath": "/somewhere"}]})
+    assert wiring.plugin_installed(tmp_path) is False
+
+
+def test_another_plugin_is_not_ours(tmp_path):
+    write_register(tmp_path, {"something-else@rentctl": [{"scope": "user"}]})
+    assert wiring.plugin_installed(tmp_path) is False
+
+
+# ---------------------------------------------------------------------------
+# The version has exactly one home
+#
+# It used to have two -- a literal in `pyproject.toml` and another in
+# `src/rentctl/__init__.py` -- with nothing tying them together and no test
+# comparing them. A bump that touched one and missed the other would publish a
+# package whose `rent --version` disagreed with its own metadata, and whose three
+# generated manifests agreed with neither. These tests fail if anyone reintroduces
+# the second home.
+# ---------------------------------------------------------------------------
+
+def _pyproject():
+    root = Path(__file__).resolve().parent.parent
+    with (root / "pyproject.toml").open("rb") as fh:
+        return root, tomllib.load(fh)
+
+
+def test_pyproject_does_not_restate_the_version():
+    """A literal `version` under `[project]` is the defect coming back."""
+    root, cfg = _pyproject()
+    assert "version" not in cfg["project"], (
+        "pyproject.toml states a literal version again. The version belongs only in "
+        "src/rentctl/__init__.py; pyproject derives it via [tool.hatch.version]."
+    )
+    assert "version" in cfg["project"]["dynamic"]
+
+
+def test_hatch_reads_the_version_from_the_module_that_defines_it():
+    """The build's source and the manifests' source must be the same file.
+
+    `core/wiring.py` imports `__version__` from the source tree to stamp the
+    plugin, marketplace and registry manifests. If hatchling read the version
+    from anywhere else, a build and a manifest render could disagree.
+    """
+    root, cfg = _pyproject()
+    declared = root / cfg["tool"]["hatch"]["version"]["path"]
+    assert declared == root / "src" / "rentctl" / "__init__.py"
+    assert declared.read_text(encoding="utf-8").count("__version__ = ") == 1
+
+
+def test_the_built_metadata_version_matches_the_module():
+    """Belt and braces: whatever hatchling extracts is what the code reports.
+
+    Runs hatchling's own version hook rather than re-parsing the file with a
+    second regex -- a test that reimplements the mechanism it checks agrees with
+    itself, not with the build.
+    """
+    root, _ = _pyproject()
+    core = pytest.importorskip("hatchling.metadata.core")
+    manager = pytest.importorskip("hatchling.plugin.manager")
+    metadata = core.ProjectMetadata(str(root), manager.PluginManager())
+    assert metadata.version == rentctl.__version__

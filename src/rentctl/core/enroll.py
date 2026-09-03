@@ -347,7 +347,7 @@ def enroll(
     # Wiring is outside the lock: it touches the project's own files, not the
     # shared registry, and holding a machine-wide lock across it would serialize
     # unrelated enrollments for no benefit.
-    plugin = plugin_installed(claude_home)
+    plugin = plugin_installed(claude_home, root)
     bindings = select(root, runtimes)
     # Computed BEFORE the loop, which is load-bearing: `install_rule` writes the
     # very files `configured_in()` looks for (GEMINI.md, .gemini/), so asking

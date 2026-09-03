@@ -1,0 +1,15 @@
+{
+  "name": "rentctl",
+  "owner": {
+    "name": "Michael Drake",
+    "url": "https://github.com/Michael-Drake"
+  },
+  "description": "The rentctl plugin — the MCP server plus the session hooks that tear leased dev environments down when the session ends.",
+  "plugins": [
+    {
+      "name": "rentctl",
+      "source": "./plugin",
+      "description": "Leased dev environments for AI coding sessions — every server dies when its session ends, so none are left running rogue."
+    }
+  ]
+}

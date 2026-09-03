@@ -82,6 +82,27 @@ class Clock:
         self.now = self.now + timedelta(**kw)
 
 
+def install_plugin(claude_home: Path, name: str = "devctl", scope: str = "user",
+                   project_path: Path | None = None) -> None:
+    """Write Claude Code's install register as a real `claude plugin install`
+    leaves it (WI-0028).
+
+    Shared rather than repeated because the previous shape — a marker directory
+    at `plugins/<name>` — was wrong, and each test carrying its own copy of it is
+    what let `plugin_installed()` return a constant False for a month while three
+    tests agreed it worked. One definition, so the next schema change breaks
+    loudly in one place.
+    """
+    entry: dict = {"scope": scope}
+    if project_path is not None:
+        entry["projectPath"] = str(project_path)
+    d = claude_home / "plugins"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "installed_plugins.json").write_text(
+        json.dumps({"version": 2, "plugins": {f"{name}@{name}": [entry]}})
+    )
+
+
 @pytest.fixture
 def devctl_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> DevctlPaths:
     """Redirect config + state roots to a tmp dir; return the resolved paths."""

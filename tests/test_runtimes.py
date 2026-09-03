@@ -232,8 +232,10 @@ def test_the_plugin_supplies_hooks_but_never_the_rule(repo, devctl_home, tmp_pat
     """ADR-0011 §1. The plugin is a hooks delivery mechanism; it puts nothing in
     the project's own context file, so skipping the rule when it is installed
     would leave exactly the projects that use it stating no policy."""
+    from conftest import install_plugin
+
     claude_home = tmp_path / "claude"
-    (claude_home / "plugins" / "devctl").mkdir(parents=True)
+    install_plugin(claude_home)
     root = repo()
     result = enroll.enroll(root, devctl_home, approve=YES, claude_home=claude_home,
                            runtimes=("claude-code",))

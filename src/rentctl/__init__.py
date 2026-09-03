@@ -12,4 +12,8 @@ over one core (``rentctl.core``). See ``README.md`` for the user-facing
 contract, including the security model.
 """
 
-__version__ = "1.0.0"
+# THE version. `pyproject.toml` declares `dynamic = ["version"]` and hatchling reads
+# this literal at build time, so the package metadata is derived from this line rather
+# than restated alongside it. `core/wiring.py` imports it to stamp the plugin,
+# marketplace and registry manifests. Bumping it here is the whole of a version bump.
+__version__ = "1.0.1"
