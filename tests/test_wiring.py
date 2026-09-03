@@ -544,7 +544,22 @@ def test_the_marketplace_source_points_at_a_real_plugin():
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SERVER_JSON_PATH = REPO_ROOT / "server.json"
-PUBLIC_README = REPO_ROOT / "README-public.md"
+def published_readme() -> Path:
+    """The README that actually ships, under whichever name this tree gives it.
+
+    `publish.py` maps `README-public.md` -> `README.md`, and this test file ships
+    too, so it runs in two trees where the published README has two different
+    names. Pinning the private name made the marker test pass here and fail in the
+    only tree it is about -- the published one, which is what the MCP registry
+    fetches and greps. It shipped that way and went red on the first CI run after
+    the marker landed. Order matters: the private tree has BOTH files and its
+    `README.md` is the internal one, so the public name is checked first.
+    """
+    for name in ("README-public.md", "README.md"):
+        candidate = REPO_ROOT / name
+        if candidate.exists():
+            return candidate
+    raise AssertionError(f"no published README under {REPO_ROOT}")
 
 
 def test_the_checked_in_server_json_matches_what_wiring_renders():
@@ -573,7 +588,11 @@ def test_the_published_readme_carries_the_ownership_marker():
     repo, so a release that drops it makes the registry publish fail with nothing
     in the repo looking wrong. 1.0.0 shipped without it, which is why the registry
     entry could not be published against 1.0.0 at all."""
-    assert wiring.MCP_NAME_MARKER in PUBLIC_README.read_text()
+    readme = published_readme()
+    assert wiring.MCP_NAME_MARKER in readme.read_text(encoding="utf-8"), (
+        f"{readme.name} does not carry {wiring.MCP_NAME_MARKER!r} — the registry "
+        "greps the PUBLISHED artifact for it, so a release without it cannot be listed"
+    )
 
 
 def test_the_marker_names_the_server_it_publishes():
