@@ -58,7 +58,7 @@ from typing import Any
 from .paths import DevctlPaths
 from .registry import Registry
 from .runtimes import CLAUDE_CODE, RuntimeBinding
-from .wiring import COMMAND, OWNED_COMMANDS
+from .wiring import COMMAND, INSTALL_COMMAND, OWNED_COMMANDS, PluginState, plugin_state
 
 # --- statuses -------------------------------------------------------------
 
@@ -71,6 +71,12 @@ UNKNOWN = "unknown"
 #: thing to fix, not a thing that is broken now, and a detector that pages on
 #: warnings gets muted, which is the only failure mode worse than not existing.
 EXIT_NONZERO = (FAIL, UNKNOWN)
+
+# Where a project's session hooks come from (WI-0070).
+SOURCE_PLUGIN = "plugin"
+SOURCE_SETTINGS = "settings"
+SOURCE_BOTH = "both"
+SOURCE_NONE = "none"
 
 #: How long the capability probe may take before we call it UNKNOWN rather than
 #: FAIL. A hung probe is not evidence of a broken shim.
@@ -91,11 +97,16 @@ class Check:
     status: str
     detail: str
     probe: str = ""
+    #: For a hooks check, where the hooks come from (``SOURCE_*``). Empty for
+    #: every other check.
+    source: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"check": self.name, "status": self.status, "detail": self.detail}
         if self.probe:
             out["probe"] = self.probe
+        if self.source:
+            out["source"] = self.source
         return out
 
 
@@ -294,46 +305,68 @@ def check_project_hooks(
     source_dir: Path,
     *,
     binding: RuntimeBinding = CLAUDE_CODE,
+    claude_home: Path | None = None,
 ) -> Check:
-    """Are this project's wired hooks commands that can actually run?
+    """Are this project's hooks wired — by whom — and can they actually run?
 
     The outage's signature: the settings file said ``rent sweep``, the string was
     present and correct, and the command did not exist. So this resolves the
     command's head on PATH rather than merely finding it in the file — the one
     difference between a wired project and a working one.
+
+    **Two sources, and the check has to see both** (WI-0070). Hooks reach a
+    Claude Code session from the project's settings file *or* from the rentctl
+    plugin. Reading only the settings file warned "layer 3 alone" on exactly the
+    published install path, where the plugin supplies the hooks and ``init``
+    deliberately writes none. So the result names its ``source``:
+
+    ============  ======  =====================================================
+    source        status  why
+    ============  ======  =====================================================
+    ``plugin``    OK      plugin enabled here, and ``rent`` resolves
+    ``settings``  OK      settings file wires them, all resolvable
+    ``both``      WARN    double-wired: every SessionEnd runs teardown twice
+    ``none``      WARN    layer 3 alone (unchanged)
+    ============  ======  =====================================================
+
+    **Double-wired is a WARN, not a FAIL and not an OK.** Claude Code
+    deduplicates an identical handler across settings files but keeps "a
+    plugin's … copy of the same handler separate", so both fire, in parallel.
+    That is safe: ``env_down`` takes the per-project lock and ``_down_lease``
+    re-reads the lease file *under* it, so whichever run loses the race finds no
+    lease, stops nothing and records nothing. It is still worth fixing — two
+    copies of one wiring, upgraded by two different mechanisms, is the drift
+    class this module's history is made of — but nothing is broken now, and
+    paging on it is how a detector gets muted.
+
+    A plugin state that cannot be determined is never folded into either
+    answer: with no settings hooks it is ``UNKNOWN`` (we cannot say whether
+    anything is wired); with settings hooks it is ``WARN`` (they are wired; we
+    cannot rule out the double).
     """
     name = f"hooks:{project}"
+    if binding is CLAUDE_CODE:
+        plugin = plugin_state(claude_home, source_dir)
+    else:
+        plugin = PluginState(False, f"the rentctl plugin does not apply to {binding.label}")
+
     settings_path = binding.hooks_path(source_dir)
+    commands: list[str] = []
     if not settings_path.exists():
         legacy = binding.legacy_hooks_path(source_dir)
         if legacy is not None and legacy.exists():
             settings_path = legacy
-        else:
-            return Check(
-                name,
-                WARN,
-                f"no settings file at {settings_path} — this project is enrolled "
-                f"in the registry but has no hooks wired",
-                probe=str(settings_path),
-            )
-    try:
-        settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return Check(name, UNKNOWN, f"{settings_path} will not parse: {exc}",
-                     probe=str(settings_path))
-    if not isinstance(settings, dict):
-        return Check(name, UNKNOWN, f"{settings_path} is not a JSON object",
-                     probe=str(settings_path))
-
-    commands = _hook_commands(settings)
-    if not commands:
-        return Check(
-            name,
-            WARN,
-            f"{settings_path} wires no rentctl hooks — teardown for this project "
-            f"depends on layer 3 alone",
-            probe=str(settings_path),
-        )
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return Check(name, UNKNOWN, f"{settings_path} will not parse: {exc}",
+                         probe=str(settings_path))
+        if not isinstance(settings, dict):
+            return Check(name, UNKNOWN, f"{settings_path} is not a JSON object",
+                         probe=str(settings_path))
+        commands = _hook_commands(settings)
+    probe = f"shutil.which(head) for each hook in {settings_path}; plugin_state()"
 
     broken = []
     for command in commands:
@@ -346,13 +379,85 @@ def check_project_hooks(
             FAIL,
             f"{len(broken)} of {len(commands)} wired hook(s) name a command that "
             f"does not resolve: {broken!r} — these are failing silently every session",
-            probe=f"shutil.which(head) for each hook in {settings_path}",
+            probe=probe,
+            source=SOURCE_BOTH if plugin.active else SOURCE_SETTINGS,
+        )
+
+    if commands and plugin.active:
+        return Check(
+            name,
+            WARN,
+            f"double-wired: {plugin.detail}, and {settings_path} also wires "
+            f"{len(commands)} rentctl hook(s). Claude Code does not deduplicate a "
+            f"plugin's hook against a settings-file copy, so each SessionEnd runs "
+            f"teardown twice. Teardown is idempotent under the per-project lock — "
+            f"the second run finds no lease — so this is redundancy, not breakage; "
+            f"but the two copies are upgraded by different mechanisms and can drift",
+            probe=probe,
+            source=SOURCE_BOTH,
+        )
+    if commands and plugin.active is None:
+        return Check(
+            name,
+            WARN,
+            f"{len(commands)} wired hook(s) in {settings_path}, all resolvable — but "
+            f"cannot tell whether the plugin also wires them ({plugin.detail})",
+            probe=probe,
+            source=SOURCE_SETTINGS,
+        )
+    if commands:
+        return Check(
+            name,
+            OK,
+            f"{len(commands)} wired hook(s) in {settings_path}, all resolvable",
+            probe=probe,
+            source=SOURCE_SETTINGS,
+        )
+
+    if plugin.active:
+        if shutil.which(COMMAND) is None:
+            return Check(
+                name,
+                FAIL,
+                f"{plugin.detail}, but its hooks call {COMMAND!r}, which does not "
+                f"resolve on PATH — session-end cleanup is off until "
+                f"`{INSTALL_COMMAND}`",
+                probe=probe,
+                source=SOURCE_PLUGIN,
+            )
+        return Check(
+            name,
+            OK,
+            f"hooks supplied by the plugin — {plugin.detail}; {COMMAND!r} resolves",
+            probe=probe,
+            source=SOURCE_PLUGIN,
+        )
+    if plugin.active is None:
+        return Check(
+            name,
+            UNKNOWN,
+            f"{settings_path} wires no rentctl hooks, and cannot tell whether the "
+            f"plugin supplies them: {plugin.detail}",
+            probe=probe,
+            source=SOURCE_NONE,
+        )
+
+    if not settings_path.exists():
+        return Check(
+            name,
+            WARN,
+            f"no settings file at {settings_path} and {plugin.detail} — this "
+            f"project is enrolled in the registry but has no hooks wired",
+            probe=probe,
+            source=SOURCE_NONE,
         )
     return Check(
         name,
-        OK,
-        f"{len(commands)} wired hook(s), all resolvable",
-        probe=f"shutil.which(head) for each hook in {settings_path}",
+        WARN,
+        f"{settings_path} wires no rentctl hooks and {plugin.detail} — teardown "
+        f"for this project depends on layer 3 alone",
+        probe=probe,
+        source=SOURCE_NONE,
     )
 
 
@@ -364,8 +469,13 @@ def diagnose(
     *,
     runner: Runner | None = None,
     binding: RuntimeBinding = CLAUDE_CODE,
+    claude_home: Path | None = None,
 ) -> Report:
-    """Run every check and return the report. Never raises."""
+    """Run every check and return the report. Never raises.
+
+    ``claude_home`` is where Claude Code keeps its plugin register and user
+    settings (default ``~/.claude``); injectable so tests never read the real one.
+    """
     paths = paths or DevctlPaths.default()
     report = Report()
 
@@ -391,7 +501,9 @@ def diagnose(
                 )
                 continue
             report.checks.append(
-                check_project_hooks(name, Path(entry.source_dir), binding=binding)
+                check_project_hooks(
+                    name, Path(entry.source_dir), binding=binding, claude_home=claude_home
+                )
             )
     return report
 

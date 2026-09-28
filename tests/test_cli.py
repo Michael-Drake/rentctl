@@ -44,6 +44,17 @@ class RecordingService:
         return {"ok": True, "swept": [], "kept": []}
 
 
+def test_version_prints_the_single_version_source(capsys):
+    """WI-0066. Subcommands are required, so --version has to short-circuit the
+    parser before that check -- and must not need a service or any state."""
+    import rentctl
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["--version"], service=RecordingService())
+    assert exit_info.value.code == 0
+    assert capsys.readouterr().out == f"rentctl {rentctl.__version__}\n"
+
+
 def test_up_routes_and_passes_args(capsys):
     rec = RecordingService()
     rc = cli.main(

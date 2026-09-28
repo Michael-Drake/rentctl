@@ -27,6 +27,7 @@ import json
 import sys
 from pathlib import Path
 
+from . import __version__
 from .core import enroll as enroll_mod
 from .core import runtimes as runtimes_mod
 from .core import wiring
@@ -44,7 +45,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="leased dev environments — a dev server never outlives the work that needed it"
     )
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    # The distribution's name, not the typed alias: this answers "which rentctl
+    # is installed", and `rent 1.0.1` would name a package that does not exist.
+    # argparse's version action exits before the required-subcommand check.
+    parser.add_argument("--version", action="version", version=f"rentctl {__version__}")
+    sub =parser.add_subparsers(dest="cmd", required=True)
 
     up = sub.add_parser("up", help="start (or renew) a project's environment")
     up.add_argument("project", help="registry project key")

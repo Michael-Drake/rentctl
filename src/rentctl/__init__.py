@@ -16,4 +16,4 @@ contract, including the security model.
 # this literal at build time, so the package metadata is derived from this line rather
 # than restated alongside it. `core/wiring.py` imports it to stamp the plugin,
 # marketplace and registry manifests. Bumping it here is the whole of a version bump.
-__version__ = "1.0.1"
+__version__ = "1.0.2"

@@ -1,6 +1,6 @@
 {
   "name": "rentctl",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Leased dev environments for AI coding sessions — every server dies when its session ends, so none are left running rogue.",
   "author": {
     "name": "Michael Drake"
@@ -21,7 +21,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "rent down --all --cwd \"$CLAUDE_PROJECT_DIR\" --reason session-end",
+            "command": "if command -v rent >/dev/null 2>&1; then rent down --all --cwd \"$CLAUDE_PROJECT_DIR\" --reason session-end; else printf '%s\\n' 'rentctl: session-end cleanup did not run because `rent` is not on PATH. Install it with: uv tool install rentctl' >&2; exit 2; fi",
             "timeout": 30
           }
         ]
@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "rent sweep",
+            "command": "if command -v rent >/dev/null 2>&1; then rent sweep; else printf '%s\\n' '{\"systemMessage\": \"rentctl: the `rent` command is not on PATH, so session-end cleanup is OFF and the rentctl MCP tools will not load. The plugin runs your installed rentctl; install it with: uv tool install rentctl\", \"hookSpecificOutput\": {\"hookEventName\": \"SessionStart\", \"additionalContext\": \"rentctl is not installed on this machine (`rent` is not on PATH): its MCP tools will not load and session-end cleanup is off. If the user wants a dev server, tell them to run `uv tool install rentctl` first. Do not start a dev server by hand as a fallback.\"}}'; fi",
             "timeout": 30
           }
         ]

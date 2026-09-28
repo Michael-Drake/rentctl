@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .containment import CwdEscapesRoot, resolve_within
 from .errors import PROJECT_CONFIG_INVALID, UNKNOWN_PROFILE, DevctlError
 
 # The file a project writes by hand to describe itself — the most user-facing
@@ -238,12 +239,16 @@ class ProjectConfig:
         root = Path(repo_root).resolve()
         out: dict[str, ResolvedProfile] = {}
         for pname, p in self.profiles.items():
-            target = (root / p.cwd).resolve()
-            if not target.is_relative_to(root):
+            # The same validator worktree re-rooting uses (WI-0068), so the two
+            # places that pick a spawn directory cannot disagree on the rule. The
+            # code stays PROJECT_CONFIG_INVALID: here the fix is in devctl.toml.
+            try:
+                target = resolve_within(root, p.cwd)
+            except CwdEscapesRoot as exc:
                 raise _bad(
                     f"profile {pname!r} cwd {p.cwd!r} resolves outside the project "
-                    f"({target}) — cwd must stay within {root}"
-                )
+                    f"({exc.target}) — cwd must stay within {root}"
+                ) from None
             out[pname] = ResolvedProfile(
                 cmd=p.cmd,
                 cwd=str(target),

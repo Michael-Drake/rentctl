@@ -113,6 +113,21 @@ def test_watchdog_pid_none_survives_round_trip():
     assert Lease.from_dict(lease.to_dict()).watchdog_pid is None
 
 
+def test_with_watchdog_records_its_start_time():
+    lease = make_lease(watchdog_pid=None).with_watchdog(9999, 1784080001.5)
+    assert (lease.watchdog_pid, lease.watchdog_pid_start_time) == (9999, 1784080001.5)
+    assert Lease.from_dict(lease.to_dict()) == lease
+
+
+def test_lease_without_watchdog_start_time_still_loads():
+    """1.0.1 leases carry no start time; they must load, reading it as unrecorded."""
+    raw = make_lease().to_dict()
+    raw.pop("watchdog_pid_start_time")
+    lease = Lease.from_dict(raw)
+    assert lease.watchdog_pid == 4250
+    assert lease.watchdog_pid_start_time is None
+
+
 def test_list_lease_files(devctl_home):
     assert list_lease_files(devctl_home.leases_dir) == []
     make_lease(project="webapp").write(devctl_home.lease_file("webapp"))

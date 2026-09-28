@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import tomllib
+from pathlib import Path
 
 import pytest
 
@@ -386,6 +387,11 @@ def test_every_shipped_console_name_counts_as_ours():
     is not listed here is a hook devctl can no longer repair."""
     assert {"devctl", "rent"} <= wiring.OWNED_COMMANDS
     assert {"devctl-watchdog", "rent-watchdog"} <= wiring.OWNED_COMMANDS
+    # Read the real list rather than restating it: a subset check against a
+    # hand-copied set is how a new script ships unowned.
+    with (Path(__file__).resolve().parent.parent / "pyproject.toml").open("rb") as fh:
+        shipped = set(tomllib.load(fh)["project"]["scripts"])
+    assert shipped <= wiring.OWNED_COMMANDS
 
 
 def test_repair_works_for_a_non_claude_runtime(tmp_path):

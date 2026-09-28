@@ -137,10 +137,22 @@ class DevctlPaths:
         return self.lease_file(lease_key(project, cwd))
 
     def project_lease_files(self, project: str) -> list[Path]:
-        """Every instance's lease for one project — all lanes of it (ADR-0007)."""
+        """Every instance's lease for one project — all lanes of it (ADR-0007).
+
+        Matched by parsing each key, not by a ``<project>--*`` glob (WI-0081).
+        Project names may themselves contain ``--``, so ``app--v2``'s leases
+        start with ``app--`` and a prefix glob handed them to ``app`` — where
+        ``down app --all`` tore them down. The key format is not ambiguous, only
+        the glob was: the hash suffix never contains ``-``, so the *last* ``--``
+        is always the separator, which is the same rule the lock name already
+        uses (:func:`project_from_key`). Every filename the old glob matched for
+        its rightful project still matches, so no lease on disk goes unread.
+        """
         if not self.leases_dir.is_dir():
             return []
-        return sorted(self.leases_dir.glob(f"{project}--*.json"))
+        return sorted(
+            p for p in self.leases_dir.glob("*.json") if project_from_key(p.stem) == project
+        )
 
     def lock_file(self, project: str) -> Path:
         """Still per-*project*, deliberately: it serializes ADR-0004's port draw

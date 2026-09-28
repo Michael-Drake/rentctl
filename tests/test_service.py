@@ -7,8 +7,11 @@ refusal against a live server) lives in test_integration.py.
 
 from __future__ import annotations
 
+import json
 import shutil
+import signal
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -18,6 +21,7 @@ from rentctl.core import procutil
 from rentctl.core import service as service_mod
 from rentctl.core.errors import (
     BLOCK_EXHAUSTED,
+    CWD_ESCAPES_ROOT,
     INVALID_CWD,
     PROFILE_MISMATCH,
     REGISTRY_INVALID,
@@ -360,6 +364,29 @@ def test_down_all_instances_is_opt_in(service, devctl_home, fake_runner):
     assert one["pid"] in fake_runner.stopped
     assert two["pid"] in fake_runner.stopped
     assert devctl_home.project_lease_files("webapp") == []
+
+
+def test_down_all_instances_spares_a_project_whose_name_extends_this_one(
+    service, devctl_home, write_registry, sample_registry_data, fake_runner
+):
+    """WI-0081: ``webapp--v2`` is a legal, distinct project. Its leases start
+    with ``webapp--``, and a prefix glob made ``down webapp --all`` kill it."""
+    data = sample_registry_data
+    data["projects"]["webapp--v2"] = {
+        "block": 5190,
+        "runner": "process",
+        "profiles": {"default": {"cmd": "npm run dev", "cwd": "/tmp/v2", "port_env": "PORT"}},
+    }
+    write_registry(data)
+    mine = service.env_up("webapp", cwd="/worktrees/lane-1")
+    theirs = service.env_up("webapp--v2", cwd="/worktrees/lane-1")
+    assert theirs["port"] == 5190  # drew from its own block, not blocked by webapp's
+
+    res = service.env_down("webapp", all_instances=True)
+    assert [d["cwd"] for d in res["downed"]] == ["/worktrees/lane-1"]
+    assert mine["pid"] in fake_runner.stopped
+    assert theirs["pid"] not in fake_runner.stopped
+    assert devctl_home.lease_file_for("webapp--v2", "/worktrees/lane-1").exists()
 
 
 def test_down_all_instances_records_each_as_layer_1(service):
@@ -1049,6 +1076,25 @@ def test_two_lanes_get_two_ports_and_two_directories(worktree_service, fake_runn
     ]
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+def test_up_from_a_lane_whose_subdir_escapes_is_refused_not_spawned(
+    worktree_service, fake_runner, devctl_home, tmp_path
+):
+    """WI-0068: a lane's ``frontend`` symlinked outside the repo must never reach
+    the runner — and must not quietly run the main checkout instead either."""
+    svc, main, lane = worktree_service
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    shutil.rmtree(lane / "frontend")
+    (lane / "frontend").symlink_to(outside, target_is_directory=True)
+
+    res = svc.env_up("webapp", cwd=str(lane))
+    assert res["ok"] is False
+    assert res["error"] == CWD_ESCAPES_ROOT
+    assert fake_runner.start_cwds == []
+    assert not devctl_home.lease_file_for("webapp", str(lane)).exists()
+
+
 # --- readiness: "not on loopback" is not "did not start" --------------------
 #
 # Reported from a pilot project, 2026-07-30. A server that binds a specific
@@ -1279,3 +1325,200 @@ def test_up_refuses_when_our_process_died_and_a_stranger_answers(
     assert res["ok"] is False
     assert res["error"] == START_TIMEOUT
     assert "another process" in res["message"]
+
+
+# --- WI-0069: the watchdog is signalled only if it is provably ours ---------
+#
+# Leases survive a reboot, and `claude --continue` skips the startup sweep, so a
+# SessionEnd teardown can meet a lease whose `watchdog_pid` now names somebody
+# else's process. Each test below stands a REAL disposable child in for the
+# watchdog: a stand-in that can actually receive SIGTERM is the only way to
+# prove it was — or was not — sent. Nothing else on the machine is ever named.
+
+
+def _sleeper() -> subprocess.Popen:
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
+
+def _reap(child: subprocess.Popen) -> None:
+    if child.poll() is None:
+        child.kill()
+    child.wait(timeout=5)
+
+
+def _still_running(child: subprocess.Popen) -> bool:
+    try:
+        child.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        return True
+    return False
+
+
+def _skips(service) -> list[dict]:
+    return [e for e in service.events.read() if e["event"] == "watchdog_signal_skipped"]
+
+
+def test_watchdog_with_matching_start_time_is_signalled(service, devctl_home):
+    child = _sleeper()
+    try:
+        started = procutil.observe_start_time(child.pid)
+        assert started is not None
+        service.watchdog_spawn = lambda key: ProcessHandle(pid=child.pid, pid_start_time=started)
+        service.env_up("webapp", cwd="/proj/webapp")
+        lease = Lease.read(devctl_home.lease_file_for("webapp", "/proj/webapp"))
+        assert lease.watchdog_pid == child.pid
+        assert lease.watchdog_pid_start_time == started
+
+        res = service.env_down("webapp", cwd="/proj/webapp")
+
+        assert res["ok"] is True
+        assert child.wait(timeout=5) == -signal.SIGTERM
+        assert _skips(service) == []
+    finally:
+        _reap(child)
+
+
+def test_watchdog_pid_with_a_different_start_time_is_not_signalled(service, devctl_home):
+    """The reboot case: the pid is alive, but it is not the process we spawned."""
+    child = _sleeper()
+    try:
+        started = procutil.observe_start_time(child.pid)
+        assert started is not None
+        recycled = ProcessHandle(pid=child.pid, pid_start_time=started - 3600.0)
+        service.watchdog_spawn = lambda key: recycled
+
+        service.env_up("webapp", cwd="/proj/webapp")
+        res = service.env_down("webapp", cwd="/proj/webapp")
+
+        assert res["ok"] is True
+        assert _still_running(child), "a process that merely inherited the pid was signalled"
+        (skip,) = _skips(service)
+        assert skip["pid"] == child.pid
+        assert skip["reason"] == "pid-recycled"
+        # The teardown itself still completed: the guard narrows the watchdog
+        # signal, it does not hold the lease hostage.
+        assert not devctl_home.lease_file_for("webapp", "/proj/webapp").exists()
+    finally:
+        _reap(child)
+
+
+def test_legacy_lease_without_a_watchdog_start_time_is_not_signalled(service, devctl_home):
+    """A 1.0.1 lease records only the pid — there is nothing to verify it against."""
+    child = _sleeper()
+    try:
+        service.env_up("webapp", cwd="/proj/webapp")
+        path = devctl_home.lease_file_for("webapp", "/proj/webapp")
+        # Rewrite it exactly as 1.0.1 did: a watchdog pid and no start-time key.
+        raw = Lease.read(path).to_dict()
+        raw["watchdog_pid"] = child.pid
+        raw.pop("watchdog_pid_start_time", None)
+        path.write_text(json.dumps(raw))
+        assert Lease.read(path).watchdog_pid_start_time is None  # old leases still load
+
+        res = service.env_down("webapp", cwd="/proj/webapp")
+
+        assert res["ok"] is True
+        assert _still_running(child)
+        (skip,) = _skips(service)
+        assert skip["pid"] == child.pid
+        assert skip["reason"] == "unverifiable"
+        assert not path.exists()  # removing it is what makes a live watchdog exit
+    finally:
+        _reap(child)
+
+
+def test_watchdog_that_is_already_gone_is_no_error(service, devctl_home):
+    child = _sleeper()
+    started = procutil.observe_start_time(child.pid)
+    assert started is not None
+    child.kill()
+    child.wait(timeout=5)
+    service.watchdog_spawn = lambda key: ProcessHandle(pid=child.pid, pid_start_time=started)
+
+    service.env_up("webapp", cwd="/proj/webapp")
+    res = service.env_down("webapp", cwd="/proj/webapp")
+
+    assert res["ok"] is True
+    assert res["was_running"] is True
+    assert not devctl_home.lease_file_for("webapp", "/proj/webapp").exists()
+    # A watchdog that exited on its own is the ordinary case, not a skipped kill.
+    assert _skips(service) == []
+
+
+def test_spawn_watchdog_records_the_start_time(devctl_home, monkeypatch):
+    """The real spawner hands back a verifiable handle, not a bare pid."""
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def popen_sleeper(argv, **kw):
+        # Same detachment as the real spawn, but a sleeper instead of a watchdog,
+        # so no rentctl process ever runs against this test's state.
+        proc = real_popen([sys.executable, "-c", "import time; time.sleep(60)"], **kw)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(service_mod.subprocess, "Popen", popen_sleeper)
+    svc = Service(devctl_home, watchdog_spawn=None)
+    try:
+        got = svc._spawn_watchdog("webapp--deadbeef")
+        (proc,) = spawned
+        assert isinstance(got, ProcessHandle)
+        assert got.pid == proc.pid
+        assert procutil.start_time_matches(got.pid_start_time, procutil.observe_start_time(proc.pid))
+    finally:
+        for proc in spawned:
+            _reap(proc)
+
+
+def test_spawn_watchdog_that_dies_before_observation_returns_a_bare_pid(
+    devctl_home, monkeypatch
+):
+    """No start time to record → a bare pid, which teardown will never signal."""
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def popen_sleeper(argv, **kw):
+        proc = real_popen([sys.executable, "-c", "import time; time.sleep(60)"], **kw)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(service_mod.subprocess, "Popen", popen_sleeper)
+    monkeypatch.setattr(procutil, "observe_start_time", lambda pid: None)
+    svc = Service(devctl_home, watchdog_spawn=None)
+    try:
+        got = svc._spawn_watchdog("webapp--deadbeef")
+        (proc,) = spawned
+        assert got == proc.pid
+    finally:
+        for proc in spawned:
+            _reap(proc)
+
+
+def test_watchdog_that_exits_between_check_and_signal_is_no_error(service, monkeypatch):
+    """The check passed, then the pid vanished before SIGTERM landed.
+
+    Faked end to end — a fake pid, a faked observation, a faked failing kill —
+    so no real process is ever named by this test.
+    """
+    monkeypatch.setattr(procutil, "observe_start_time", lambda pid: 1784080000.0)
+
+    def _vanished(pid, sig):
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(service_mod.os, "kill", _vanished)
+    lease = Lease(
+        project="webapp",
+        profile="default",
+        runner="process",
+        handle={"pid": 1000, "pid_start_time": 1000.0},
+        port=5180,
+        session="s",
+        cwd="/proj/webapp",
+        created=datetime(2026, 7, 14, 8, 0, tzinfo=CDT),
+        expires=datetime(2026, 7, 14, 9, 0, tzinfo=CDT),
+        log="/dev/null",
+        watchdog_pid=424242,
+        watchdog_pid_start_time=1784080000.0,
+    )
+    service._kill_watchdog(lease)  # must not raise
+    assert _skips(service) == []

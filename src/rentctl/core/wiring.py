@@ -33,6 +33,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -130,6 +132,97 @@ def hooks_fragment(binding: RuntimeBinding = CLAUDE_CODE) -> dict[str, Any]:
     }
 
 
+# --- the plugin's missing-CLI guard (ADR-0015, WI-0071) --------------------
+
+# The one command that makes a plugin-only install work. Spelled once, because it
+# is the whole remedy and it appears in two user-facing messages.
+INSTALL_COMMAND = f"uv tool install {SERVER_NAME}"
+
+# What the user sees when the plugin is installed and the CLI it runs is not.
+# ASCII on purpose: it travels through `sh -c` inside single quotes, and a
+# non-UTF-8 locale on the hook's shell is not ours to rule out.
+MISSING_CLI_SESSION_START = (
+    f"rentctl: the `{COMMAND}` command is not on PATH, so session-end cleanup is OFF "
+    f"and the rentctl MCP tools will not load. The plugin runs your installed "
+    f"rentctl; install it with: {INSTALL_COMMAND}"
+)
+
+# What the model is told in the same case. The policy rule (ADR-0011 §3) already
+# says "if rentctl is not available to you, stop and say so"; this is the moment
+# that rule exists for, so the model gets the fact rather than inferring it from
+# absent tools.
+MISSING_CLI_CONTEXT = (
+    f"rentctl is not installed on this machine (`{COMMAND}` is not on PATH): its "
+    f"MCP tools will not load and session-end cleanup is off. If the user wants a "
+    f"dev server, tell them to run `{INSTALL_COMMAND}` first. Do not start a dev "
+    f"server by hand as a fallback."
+)
+
+MISSING_CLI_SESSION_END = (
+    f"rentctl: session-end cleanup did not run because `{COMMAND}` is not on PATH. "
+    f"Install it with: {INSTALL_COMMAND}"
+)
+
+
+def _when_cli_present(command: str, otherwise: str) -> str:
+    """``command`` if :data:`COMMAND` resolves on PATH, else ``otherwise``.
+
+    POSIX sh only — Claude Code runs a shell-form hook with ``sh -c`` on macOS and
+    Linux — and nothing but builtins on the missing branch (``command -v``,
+    ``printf``, ``exit``), because that branch runs exactly when PATH is the thing
+    that is broken.
+    """
+    return f"if command -v {COMMAND} >/dev/null 2>&1; then {command}; else {otherwise}; fi"
+
+
+def plugin_hooks_fragment() -> dict[str, Any]:
+    """The plugin's hooks: :func:`hooks_fragment`, each command guarded.
+
+    **Why the plugin gets a guard and ``init`` does not.** ``init`` is run *by*
+    ``rent``, so a project it wired had the CLI when it was wired. The plugin has
+    no such guarantee: installed from a marketplace with no ``uv tool install``,
+    every hook exits 127 and a SessionEnd failure is shown to nobody — the user
+    believes cleanup is on and it is not (WI-0071). ADR-0015 keeps the hooks
+    calling the user's installed ``rent`` and makes its absence loud instead.
+
+    * **SessionStart** prints hook JSON: ``systemMessage`` is the one field Claude
+      Code documents as shown to the *user*; plain stdout on this event reaches
+      only the model. ``additionalContext`` tells the model the same fact.
+      Exit 0 — the JSON is the message, and a non-zero exit would add a generic
+      "hook error" notice that says less.
+    * **SessionEnd** discards JSON output entirely, so the only channel left is
+      exit 2, whose stderr Claude Code shows to the user. It will often land as
+      the terminal closes; on ``/clear`` and ``/resume`` it is seen.
+
+    The guarded branch runs the **unaltered** ``init`` command, so the two
+    delivery paths still execute the same teardown (ADR-0002 §5). The ``init``
+    fragment itself is left bare on purpose: :func:`_group_is_ours` recognises a
+    hook by its first token, and an ``if`` there would make every enrolled
+    project's hook look foreign to the next ``init``.
+    """
+    hooks = hooks_fragment(CLAUDE_CODE)
+    start = hooks["SessionStart"][0]["hooks"][0]
+    start_output = json.dumps(
+        {
+            "systemMessage": MISSING_CLI_SESSION_START,
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": MISSING_CLI_CONTEXT,
+            },
+        },
+        ensure_ascii=True,
+    )
+    start["command"] = _when_cli_present(
+        start["command"], f"printf '%s\\n' {shlex.quote(start_output)}"
+    )
+    end = hooks["SessionEnd"][0]["hooks"][0]
+    end["command"] = _when_cli_present(
+        end["command"],
+        f"printf '%s\\n' {shlex.quote(MISSING_CLI_SESSION_END)} >&2; exit 2",
+    )
+    return hooks
+
+
 def mcp_fragment() -> dict[str, Any]:
     """Our entry for an MCP config's ``mcpServers`` object.
 
@@ -152,7 +245,9 @@ def plugin_manifest() -> dict[str, Any]:
     :func:`hooks_fragment` and :func:`mcp_fragment`, the same functions `init`
     writes from, so the plugin and the CLI cannot disagree. A hand-kept second
     copy is the exact drift this module's docstring forbids, and the checked-in
-    artifact is guarded by a test that re-renders and compares.
+    artifact is guarded by a test that re-renders and compares. The hooks go
+    through :func:`plugin_hooks_fragment`, which wraps each ``init`` command —
+    unaltered — in a check that the CLI is installed (ADR-0015).
 
     Both are inlined rather than pointed at sibling files. The schema allows
     either; inlining keeps the whole plugin one generated artifact, so there is
@@ -190,7 +285,7 @@ def plugin_manifest() -> dict[str, Any]:
         "repository": "https://github.com/Michael-Drake/rentctl",
         "license": "Apache-2.0",
         "keywords": ["dev-server", "lease", "cleanup", "mcp", "ports"],
-        "hooks": hooks_fragment(CLAUDE_CODE),
+        "hooks": plugin_hooks_fragment(),
         "mcpServers": {SERVER_NAME: mcp_fragment()},
     }
 
@@ -286,10 +381,13 @@ def registry_manifest() -> dict[str, Any]:
     defect as a hand-copied plugin manifest, with a worse failure — the registry
     would advertise a version of rentctl that nobody can install.
 
-    ``runtimeHint`` is ``uvx`` because the console script (``rent-mcp``) is not
-    the distribution name (``rentctl``); a client assuming they match runs
-    nothing. The explicit ``--from`` spelling is what makes the two names
-    unambiguous to whatever resolves it.
+    No ``packageArguments``, deliberately (WI-0067). Clients place them AFTER
+    ``identifier@version`` (VS Code builds ``uvx [runtimeArguments]
+    <identifier>@<version> [packageArguments]``), where uvx has stopped reading
+    its own options — so 1.0.1's ``--from rentctl rent-mcp`` there became argv
+    for an executable named ``rentctl`` that did not exist. The distribution now
+    ships a ``rentctl`` console script that starts the MCP server, so the bare
+    ``uvx rentctl@<version>`` a client builds is the whole command.
     """
     return {
         "$schema": REGISTRY_SCHEMA,
@@ -304,10 +402,6 @@ def registry_manifest() -> dict[str, Any]:
                 "version": __version__,
                 "runtimeHint": "uvx",
                 "transport": {"type": "stdio"},
-                "packageArguments": [
-                    {"type": "named", "name": "--from", "value": SERVER_NAME},
-                    {"type": "positional", "value": f"{COMMAND}-mcp"},
-                ],
             }
         ],
     }
@@ -461,6 +555,7 @@ def rename_approved_mcp_server(
 OWNED_COMMANDS = frozenset({
     "devctl", "devctl-watchdog", "devctl-mcp",
     "rent", "rent-watchdog", "rent-mcp",
+    "rentctl",
 })
 
 
@@ -758,7 +853,7 @@ def plugin_installed(claude_home: Path | None = None, project_root: Path | None 
     idempotence prevents the duplicate, so being wrong in this direction costs a
     redundant hook entry; being wrong in the other costs the cleanup.
     """
-    home = Path(claude_home) if claude_home is not None else Path.home() / ".claude"
+    home = _claude_home(claude_home)
     try:
         data = json.loads((home / "plugins" / INSTALLED_PLUGINS_FILE).read_text())
         entries = data["plugins"]
@@ -766,17 +861,128 @@ def plugin_installed(claude_home: Path | None = None, project_root: Path | None 
         return False
     if not isinstance(entries, dict):
         return False
+    return bool(_covering_keys(entries, project_root))
 
+
+def _claude_home(claude_home: Path | None) -> Path:
+    return Path(claude_home) if claude_home is not None else Path.home() / ".claude"
+
+
+def _covering_keys(entries: dict[str, Any], project_root: Path | None) -> list[str]:
+    """Register keys (``<plugin>@<marketplace>``) of ours whose install covers
+    ``project_root`` — see :func:`plugin_installed` for why scope decides it."""
     root = Path(project_root).resolve() if project_root is not None else None
+    keys: list[str] = []
     for key, installs in entries.items():
         if key.split("@", 1)[0] not in (SERVER_NAME, LEGACY_SERVER_NAME):
             continue
         for install in installs if isinstance(installs, list) else []:
             if not isinstance(install, dict):
                 continue
-            if install.get("scope") in _GLOBAL_SCOPES:
-                return True
             path = install.get("projectPath")
-            if root is not None and path and Path(path).resolve() == root:
-                return True
-    return False
+            if install.get("scope") in _GLOBAL_SCOPES or (
+                root is not None and path and Path(path).resolve() == root
+            ):
+                keys.append(key)
+                break
+    return keys
+
+
+# --- is the plugin actually supplying hooks here? (WI-0070) ----------------
+
+# Managed settings can switch a plugin off for everyone, and they outrank every
+# other scope. Only the on-disk file is readable from here; server-managed
+# settings and MDM profiles are not, which :class:`PluginState` says rather than
+# pretends otherwise. Paths from code.claude.com/docs/en/settings.
+MANAGED_SETTINGS_FILES: tuple[Path, ...] = (
+    (Path("/Library/Application Support/ClaudeCode/managed-settings.json"),)
+    if sys.platform == "darwin"
+    else (Path("/etc/claude-code/managed-settings.json"),)
+)
+
+
+@dataclass(frozen=True)
+class PluginState:
+    """Whether our plugin supplies session hooks to one project.
+
+    ``active`` is three-valued on purpose: ``None`` is "I could not tell", and
+    it is not folded into either answer. :func:`plugin_installed` *does* fold it
+    — into False — because for ``init`` that is the fail-safe direction (write
+    the hooks yourself). For ``doctor`` there is no safe direction: folding into
+    True certifies cleanup nobody verified, folding into False raises a false
+    alarm, and both are how a detector loses the trust it runs on.
+    """
+
+    active: bool | None
+    detail: str
+
+
+def plugin_state(
+    claude_home: Path | None = None,
+    project_root: Path | None = None,
+    *,
+    managed_files: tuple[Path, ...] | None = None,
+) -> PluginState:
+    """Is the rentctl plugin installed for ``project_root`` **and enabled** there?
+
+    Installed is not enough: ``claude plugin disable`` leaves the install
+    register untouched and writes ``enabledPlugins: {"<key>": false}`` into a
+    settings file, and a disabled plugin's hooks do not run. Enablement is
+    resolved in Claude Code's settings precedence — managed, then
+    ``.claude/settings.local.json``, ``.claude/settings.json``,
+    ``~/.claude/settings.json`` — and the first scope with an entry for us
+    decides. A plugin no scope mentions falls back to its
+    ``defaultEnabled``, which ours does not set, so it is enabled.
+
+    Any file on that path that exists and will not parse — or an entry that is
+    not a boolean — makes the answer ``None``: the value that would have decided
+    it is exactly the one we could not read.
+    """
+    home = _claude_home(claude_home)
+    register = home / "plugins" / INSTALLED_PLUGINS_FILE
+    if not register.exists():
+        return PluginState(False, "the rentctl plugin is not installed")
+    try:
+        entries = json.loads(register.read_text())["plugins"]
+        if not isinstance(entries, dict):
+            raise TypeError("plugins is not an object")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return PluginState(None, f"cannot read the plugin register {register}: {exc}")
+
+    keys = _covering_keys(entries, project_root)
+    if not keys:
+        return PluginState(False, "the rentctl plugin is not installed for this project")
+
+    files: list[tuple[str, Path]] = [
+        ("managed", p) for p in (MANAGED_SETTINGS_FILES if managed_files is None else managed_files)
+    ]
+    if project_root is not None:
+        root = Path(project_root)
+        files += [
+            ("local", root / ".claude" / "settings.local.json"),
+            ("project", root / ".claude" / "settings.json"),
+        ]
+    files.append(("user", home / "settings.json"))
+
+    for scope, path in files:
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return PluginState(None, f"cannot read enabledPlugins from {path}: {exc}")
+        enabled = data.get("enabledPlugins") if isinstance(data, dict) else None
+        if enabled is None:
+            continue
+        if not isinstance(enabled, dict):
+            return PluginState(None, f"enabledPlugins in {path} is not an object")
+        values = [enabled[k] for k in keys if k in enabled]
+        if not values:
+            continue
+        if any(not isinstance(v, bool) for v in values):
+            return PluginState(None, f"enabledPlugins in {path} has a non-boolean entry for rentctl")
+        if any(values):
+            return PluginState(True, f"the rentctl plugin is installed and enabled ({scope} settings: {path})")
+        return PluginState(False, f"the rentctl plugin is installed but disabled ({scope} settings: {path})")
+
+    return PluginState(True, "the rentctl plugin is installed and enabled (no enabledPlugins entry; enabled by default)")

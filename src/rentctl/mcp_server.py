@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
+from . import __version__
 from .core import wiring
 from .core.events import EXPLICIT
 from .core.service import DEFAULT_LEASE_MINUTES, Service
@@ -22,6 +23,13 @@ from .core.service import DEFAULT_LEASE_MINUTES, Service
 # (ADR-0009, WI-0017) — a server whose handshake name disagrees with the key it is
 # registered under is two names for one thing in the surface a user debugs.
 mcp = FastMCP(wiring.SERVER_NAME)
+# FastMCP takes no version, so the handshake's `serverInfo.version` fell back to the
+# mcp SDK's own (1.30.0) — a number that reads as rentctl's and is not. "Which
+# rentctl answered?" is an incident question; the handshake should answer it. The
+# low-level server is private API, hence the guard: on an SDK without it, the
+# handshake just keeps the SDK's number rather than failing to import.
+if hasattr(mcp, "_mcp_server"):
+    mcp._mcp_server.version = __version__
 
 _service: Service | None = None
 

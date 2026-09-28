@@ -103,6 +103,35 @@ def test_ensure_dirs_creates_state(devctl_home):
     assert devctl_home.logs_dir.is_dir()
 
 
+def test_project_lease_files_does_not_claim_a_project_named_with_a_dash_dash(devctl_home):
+    """WI-0081: NAME_RE allows ``--``, so ``app--v2``'s leases start with ``app--``.
+    A prefix glob handed them to ``app`` — and ``down app --all`` tore them down."""
+    mine = [devctl_home.lease_file_for("app", f"/w/lane-{i}") for i in range(2)]
+    theirs = [devctl_home.lease_file_for("app--v2", f"/w/lane-{i}") for i in range(2)]
+    for p in mine + theirs:
+        p.write_text("{}")
+    assert devctl_home.project_lease_files("app") == sorted(mine)
+    assert devctl_home.project_lease_files("app--v2") == sorted(theirs)
+
+
+def test_project_lease_files_still_reads_every_existing_key_shape(devctl_home):
+    """Compatibility: any filename the old glob matched for a project that it
+    *should* have matched is still found — including a name that itself ends in
+    a dash, where the separator run is ``---``."""
+    keep = [
+        devctl_home.lease_file_for("web-", "/w/a"),        # web---<hash>.json
+        devctl_home.leases_dir / "web---legacysuffix.json",  # not a hash; old glob took it
+    ]
+    for p in keep:
+        p.write_text("{}")
+    (devctl_home.leases_dir / "web-.lock").write_text("")   # a lock, not a lease
+    assert devctl_home.project_lease_files("web-") == sorted(keep)
+
+
+def test_project_lease_files_with_no_leases_dir_is_empty(tmp_path):
+    assert DevctlPaths(tmp_path / "c", tmp_path / "s").project_lease_files("app") == []
+
+
 # --- procutil: the pure PID-recycle comparison ----------------------------
 
 def test_start_time_matches_exact():

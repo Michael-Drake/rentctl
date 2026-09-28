@@ -46,7 +46,7 @@ from .errors import (
 from .events import EventLog
 from .leases import Lease, list_lease_files
 from .locking import project_lock
-from .models import ProcInfo, Readiness
+from .models import ProcessHandle, ProcInfo, Readiness
 from .paths import DevctlPaths, lease_key, project_from_key
 from .ports import draw_port
 from .reconcile import Action, decide
@@ -111,12 +111,30 @@ def _now_local() -> datetime:
     return datetime.now().astimezone()
 
 
+# Both loopbacks, because `localhost` is not one address. Node >= 17 resolves it
+# to ::1 first on macOS, so a Vite server on defaults listens on IPv6 loopback
+# only — and a probe that dialled 127.0.0.1 alone reported it "not on loopback,
+# http://localhost will not reach it" (false) and `healthy: false` (WI-0072).
+# IPv4 goes first: it is what most servers bind, so the common path stays one
+# connect. The per-family timeout is half the old single one, so the worst case
+# is still bounded by the same second.
+_LOOPBACKS = ("127.0.0.1", "::1")
+_LOOPBACK_CONNECT_TIMEOUT_S = 0.5
+
+
 def _port_answering(port: int) -> bool:
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=1.0):
-            return True
-    except OSError:
-        return False
+    """Whether anything accepts a TCP connect on ``port`` at either loopback.
+
+    A host without IPv6 loopback fails the ``::1`` dial with an ``OSError``
+    like any refused connect, which is the right answer: nothing answers there.
+    """
+    for host in _LOOPBACKS:
+        try:
+            with socket.create_connection((host, port), timeout=_LOOPBACK_CONNECT_TIMEOUT_S):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _log_tail(path: str, n: int = _LOG_TAIL_LINES) -> list[str]:
@@ -142,7 +160,7 @@ class Service:
         runner_factory: Callable[[str], Runner] = get_runner,
         readiness_fn: Callable[[int, float, int | None], Readiness] | None = None,
         readiness_timeout: float = 30.0,
-        watchdog_spawn: Callable[[str], int | None] | None = None,
+        watchdog_spawn: Callable[[str], ProcessHandle | int | None] | None = None,
         session_id_fn: Callable[[], str] | None = None,
         event_log: EventLog | None = None,
         port_owner_fn: Callable[[int], ProcInfo | None] | None = None,
@@ -425,9 +443,14 @@ class Service:
 
                 # The watchdog babysits a *lease*, not a project — with N lanes
                 # per project, a project name would not say which one (ADR-0007 §5).
-                wpid = self.watchdog_spawn(key)
-                if wpid is not None:
-                    lease = lease.with_watchdog(wpid)
+                wd = self.watchdog_spawn(key)
+                if wd is not None:
+                    # A bare pid carries no start time, so teardown will never
+                    # signal it (WI-0069) — see `_kill_watchdog`.
+                    if isinstance(wd, ProcessHandle):
+                        lease = lease.with_watchdog(wd.pid, wd.pid_start_time)
+                    else:
+                        lease = lease.with_watchdog(wd)
                     lease.write(lease_path)
                 return self._up_result(
                     lease,
@@ -836,12 +859,46 @@ class Service:
         return True
 
     def _kill_watchdog(self, lease: Lease) -> None:
-        if lease.watchdog_pid is None:
+        """SIGTERM the lease's watchdog — only if the pid is provably still ours.
+
+        This used to signal ``watchdog_pid`` blind. Leases survive a reboot and
+        ``claude --continue`` skips the startup sweep, so the first SessionEnd
+        after one could SIGTERM whatever unrelated process had inherited the pid
+        — the exact thing the README says rentctl re-checks before doing. The
+        guard is the server's own: compare start times, same tolerance
+        (``procutil.start_time_matches``), and do nothing on doubt (WI-0069).
+
+        Every caller unlinks the lease right after this returns, and that alone
+        stops a live watchdog: ``watch_once`` returns ``GONE`` when its lease is
+        missing (watchdog.py:77-78) and ``run`` exits on any outcome other than
+        ``CONTINUE`` (watchdog.py:137-138). So declining to signal costs at most
+        one tick of an idle sleeper; signalling the wrong pid costs somebody
+        else's process. The signal is a courtesy, never the mechanism.
+        """
+        pid = lease.watchdog_pid
+        if pid is None:
+            return
+        started = lease.watchdog_pid_start_time
+        if started is None:
+            # Written by 1.0.1 (or the watchdog died before it could be observed):
+            # nothing to check the pid against, so it is not signalled at all.
+            self._record_watchdog_skip(lease, pid, "unverifiable")
+            return
+        observed = procutil.observe_start_time(pid)
+        if observed is None:
+            return  # already exited on its own — the ordinary case, nothing refused
+        if not procutil.start_time_matches(started, observed):
+            self._record_watchdog_skip(lease, pid, "pid-recycled")
             return
         try:
-            os.kill(lease.watchdog_pid, signal.SIGTERM)
+            os.kill(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
-            pass  # already gone, or not ours — the lease removal makes it self-exit anyway
+            pass  # exited between the check and the signal; the lease removal covers it
+
+    def _record_watchdog_skip(self, lease: Lease, pid: int, reason: str) -> None:
+        self.events.record(
+            ev.WATCHDOG_SIGNAL_SKIPPED, lease.project, pid=pid, reason=reason, port=lease.port
+        )
 
     def _read_lease_quiet(self, path: Path) -> Lease | None:
         try:
@@ -986,6 +1043,10 @@ class Service:
         # field nobody learns to read, and this one qualifies the `url` directly.
         out["readiness"] = readiness.value
         if readiness is Readiness.LISTENING:
+            # True only because the probe dials BOTH loopbacks: LISTENING means
+            # neither 127.0.0.1 nor ::1 answered, so no resolution of
+            # `localhost` reaches it. With an IPv4-only probe this lied about
+            # every ::1-only server (WI-0072).
             out["readiness_detail"] = (
                 "started and listening, but not on loopback — it has bound a "
                 f"specific address, so {out['url']} will not reach it"
@@ -1031,8 +1092,12 @@ class Service:
         """
         return _first_env(SESSION_ID_ENVS) or ev.UNATTRIBUTED
 
-    def _spawn_watchdog(self, key: str) -> int | None:
-        """Spawn ``rentctl.watchdog <lease-key>`` detached (§6.2). Returns its pid."""
+    def _spawn_watchdog(self, key: str) -> ProcessHandle | int:
+        """Spawn ``rentctl.watchdog <lease-key>`` detached (§6.2).
+
+        Returns a handle carrying the watchdog's start time, so teardown can
+        tell our watchdog from a process that later inherited its pid (WI-0069).
+        """
         proc = subprocess.Popen(
             [sys.executable, "-m", "rentctl.watchdog", key],
             stdout=subprocess.DEVNULL,
@@ -1040,4 +1105,10 @@ class Service:
             start_new_session=True,
             env={**os.environ},
         )
-        return proc.pid
+        started = procutil.observe_start_time(proc.pid)
+        # None only if it died between spawn and observe. A bare pid then records
+        # no start time, which `_kill_watchdog` reads as "never signal" — unlike
+        # the runner's 0.0 sentinel, it does not later log as a recycled pid.
+        if started is None:
+            return proc.pid
+        return ProcessHandle(pid=proc.pid, pid_start_time=started)

@@ -69,3 +69,37 @@ def test_svc_lazily_built(devctl_home, monkeypatch):
     monkeypatch.setattr(m, "_service", None)
     svc = m._svc()
     assert isinstance(svc, Service)
+
+
+def test_handshake_reports_rentctl_version_not_the_sdks(devctl_home):
+    """The real stdio handshake: `serverInfo.version` is rentctl's own version.
+
+    Runs the server as a subprocess over stdio, the way a client does, rather than
+    reading the attribute back — the attribute is private SDK API, and what matters
+    is the number that actually crosses the wire.
+    """
+    import json
+    import subprocess
+    import sys
+
+    from rentctl import __version__
+
+    init = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"},
+        },
+    }
+    p = subprocess.run(
+        [sys.executable, "-c", "from rentctl.mcp_server import main; main()"],
+        input=json.dumps(init) + "\n",
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    reply = json.loads(p.stdout.splitlines()[0])
+    assert reply["result"]["serverInfo"] == {"name": "rentctl", "version": __version__}

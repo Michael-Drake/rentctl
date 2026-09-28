@@ -45,6 +45,12 @@ class Lease:
     # directory was re-rooted onto it. ``None`` on leases written before
     # re-rooting existed — absent is not "same as cwd", it is "unrecorded".
     spawn_cwd: str | None = None
+    # The watchdog's ``create_time()``, captured at spawn (WI-0069) — the same
+    # PID-recycle guard the server's handle carries, so teardown can prove the
+    # pid still names our watchdog before signalling it. ``None`` on leases
+    # written by 1.0.1: absent means "unverifiable", and an unverifiable pid is
+    # never signalled.
+    watchdog_pid_start_time: float | None = None
 
     # --- serialization ----------------------------------------------------
 
@@ -56,6 +62,7 @@ class Lease:
             "handle": self.handle,
             "port": self.port,
             "watchdog_pid": self.watchdog_pid,
+            "watchdog_pid_start_time": self.watchdog_pid_start_time,
             "session": self.session,
             "cwd": self.cwd,
             "created": self.created.isoformat(),
@@ -80,6 +87,11 @@ class Lease:
                 log=d["log"],
                 watchdog_pid=(None if d.get("watchdog_pid") is None else int(d["watchdog_pid"])),
                 spawn_cwd=d.get("spawn_cwd"),
+                watchdog_pid_start_time=(
+                    None
+                    if d.get("watchdog_pid_start_time") is None
+                    else float(d["watchdog_pid_start_time"])
+                ),
             )
         except (KeyError, ValueError, TypeError) as e:
             raise DevctlError(LEASE_INVALID, f"malformed lease: {e}") from e
@@ -132,8 +144,8 @@ class Lease:
         """A copy with a pushed-out expiry (renewal = rewrite ``expires``, §6.2)."""
         return replace(self, expires=new_expires)
 
-    def with_watchdog(self, watchdog_pid: int) -> "Lease":
-        return replace(self, watchdog_pid=watchdog_pid)
+    def with_watchdog(self, watchdog_pid: int, start_time: float | None = None) -> "Lease":
+        return replace(self, watchdog_pid=watchdog_pid, watchdog_pid_start_time=start_time)
 
 
 def list_lease_files(leases_dir: Path) -> list[Path]:

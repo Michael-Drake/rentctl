@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from rentctl.core.containment import CwdEscapesRoot, resolve_within
+from rentctl.core.errors import CWD_ESCAPES_ROOT, DevctlError
 from rentctl.core.worktree import resolve_spawn_cwd
 
 # --- fake-git layer -------------------------------------------------------
@@ -271,3 +273,151 @@ def test_real_unrelated_repos_are_refused(tmp_path: Path):
     assert got.rerooted is False
     assert got.cwd == str(a.resolve())
     assert "different repository" in got.reason
+
+
+# --- containment (WI-0068) ------------------------------------------------
+#
+# `git worktree` proves the caller's checkout belongs to the same repository.
+# It proves nothing about where ``<lane>/frontend`` *points*: a lane is free to
+# replace that directory with a symlink, and ``is_dir()`` follows it. These
+# build the shape that was reproduced externally — a real enrolled checkout, a
+# sibling worktree whose ``frontend`` is a symlink — and pin the outcome.
+
+
+def _repo_and_lane(tmp_path: Path) -> tuple[Path, Path]:
+    main = tmp_path / "main"
+    (main / "frontend").mkdir(parents=True)
+    _git("init", "-q", "-b", "main", cwd=main)
+    _git("config", "user.email", "t@example.com", cwd=main)
+    _git("config", "user.name", "t", cwd=main)
+    (main / "frontend" / "package.json").write_text("{}\n")
+    _git("add", "-A", cwd=main)
+    _git("commit", "-qm", "init", cwd=main)
+    lane = tmp_path / "lane"
+    _git("worktree", "add", "-q", str(lane), "-b", "lane", cwd=main)
+    return main, lane
+
+
+def _swap_for_symlink(lane: Path, target: Path) -> None:
+    shutil.rmtree(lane / "frontend")
+    (lane / "frontend").symlink_to(target, target_is_directory=True)
+
+
+@pytestmark_git
+def test_a_symlink_that_stays_inside_the_lane_still_reroots(tmp_path: Path):
+    """Symlinks are not the problem; leaving the worktree is. An internal one is fine,
+    and the spawn is handed the resolved directory, not the link."""
+    main, lane = _repo_and_lane(tmp_path)
+    (lane / "web").mkdir()
+    _swap_for_symlink(lane, Path("web"))  # relative link, resolved against lane/
+
+    got = resolve_spawn_cwd(str(main / "frontend"), str(lane))
+    assert got.rerooted is True
+    assert got.cwd == str((lane / "web").resolve())
+
+
+@pytestmark_git
+def test_a_symlink_escaping_the_lane_is_refused_loudly(tmp_path: Path):
+    """The reproduced bug: rerooted=True onto a directory outside the repository."""
+    main, lane = _repo_and_lane(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _swap_for_symlink(lane, outside)
+
+    with pytest.raises(DevctlError) as ei:
+        resolve_spawn_cwd(str(main / "frontend"), str(lane))
+    assert ei.value.code == CWD_ESCAPES_ROOT
+    # Both ends named, so the operator can see what the lane did.
+    assert str(outside.resolve()) in ei.value.message
+    assert str(lane.resolve()) in ei.value.message
+
+
+@pytestmark_git
+def test_a_dangling_escaping_symlink_is_refused_not_treated_as_missing(tmp_path: Path):
+    """Containment is checked before existence: a link to a not-yet-existing
+    outside path is an escape, not an absent subdirectory to fall back from."""
+    main, lane = _repo_and_lane(tmp_path)
+    _swap_for_symlink(lane, tmp_path / "nowhere")
+
+    with pytest.raises(DevctlError) as ei:
+        resolve_spawn_cwd(str(main / "frontend"), str(lane))
+    assert ei.value.code == CWD_ESCAPES_ROOT
+
+
+@pytestmark_git
+def test_a_real_lane_missing_the_subdirectory_falls_back(tmp_path: Path):
+    """Missing is not escaping: the documented fallback to the approved cwd stands."""
+    main, lane = _repo_and_lane(tmp_path)
+    shutil.rmtree(lane / "frontend")
+
+    got = resolve_spawn_cwd(str(main / "frontend"), str(lane))
+    assert got.rerooted is False
+    assert got.cwd == str((main / "frontend").resolve())
+    assert "does not exist" in got.reason
+
+
+# --- the shared validator -------------------------------------------------
+
+
+def test_resolve_within_accepts_the_root_itself_and_its_children(tmp_path: Path):
+    (tmp_path / "a").mkdir()
+    assert resolve_within(tmp_path, ".") == tmp_path.resolve()
+    assert resolve_within(tmp_path, "a") == (tmp_path / "a").resolve()
+
+
+def test_resolve_within_rejects_dotdot_and_absolute_escapes(tmp_path: Path):
+    root = tmp_path / "root"
+    root.mkdir()
+    for rel in ("..", "../x", "/etc"):
+        with pytest.raises(CwdEscapesRoot):
+            resolve_within(root, rel)
+
+
+def test_resolve_within_rejects_a_sibling_sharing_the_root_as_a_string_prefix(tmp_path: Path):
+    """``/x/lane2`` starts with ``/x/lane`` as a string; it is not inside it."""
+    root, sibling = tmp_path / "lane", tmp_path / "lane2"
+    root.mkdir()
+    sibling.mkdir()
+    (root / "f").symlink_to(sibling, target_is_directory=True)
+    with pytest.raises(CwdEscapesRoot):
+        resolve_within(root, "f")
+
+
+def test_resolve_within_resolves_the_root_too(tmp_path: Path):
+    """A root reached through a symlink must not make its own contents look foreign."""
+    real = tmp_path / "real"
+    (real / "sub").mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    assert resolve_within(alias, "sub") == (real / "sub").resolve()
+
+
+def test_resolve_within_never_lets_a_symlink_loop_escape_raw(tmp_path: Path):
+    """A loop is either refused or lands inside the root; it never propagates.
+
+    Python 3.12 raises RuntimeError on a loop in non-strict ``resolve()``; 3.13+
+    returns the path unresolved. Both answers are acceptable, a traceback is not.
+    """
+    (tmp_path / "loop").symlink_to(tmp_path / "loop")
+    try:
+        got = resolve_within(tmp_path, "loop/x")
+    except CwdEscapesRoot:
+        return
+    assert got.is_relative_to(tmp_path.resolve())
+
+
+@pytest.mark.parametrize("boom", [RuntimeError("Symlink loop"), OSError(62, "ELOOP")])
+def test_resolve_within_refuses_what_it_cannot_resolve(tmp_path: Path, monkeypatch, boom):
+    """Forced, so the refusal branch is exercised on every Python, not only 3.12."""
+    real_resolve = Path.resolve
+
+    def resolve(self, strict=False):
+        if self.name == "x":
+            raise boom
+        return real_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    with pytest.raises(CwdEscapesRoot) as ei:
+        resolve_within(tmp_path, "x")
+    assert ei.value.target is None
+    assert ei.value.code == CWD_ESCAPES_ROOT

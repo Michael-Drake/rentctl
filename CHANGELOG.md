@@ -8,7 +8,70 @@ a major is **declared** by a human rather than computed.
 
 ## [Unreleased]
 
-Nothing staged.
+Nothing staged beyond 1.0.2.
+
+## [1.0.2] — release-ready, not yet published
+
+**The guarantees, not the happy path.** Two independent reviews of 1.0.1 found the
+product working as used — 73 real leases on one machine, every one ended by a cleanup
+layer — and a set of places where what rentctl promised was stronger than what it did.
+This release closes the ones that are small and independent. The larger one, owning a
+server's whole process tree rather than its launch process, is a redesign and is not in
+this release.
+
+### Fixed
+
+- **The MCP Registry install command could not start the server.** The registry entry
+  put `--from rentctl rent-mcp` in `packageArguments`, which clients place *after* the
+  package, so the command a client built — `uvx rentctl@1.0.1 --from rentctl rent-mcp` —
+  failed with "An executable named `rentctl` is not provided by package `rentctl`". The
+  wheel now ships a `rentctl` executable that starts the MCP server, and the entry needs
+  no arguments at all: `uvx rentctl@<version>`. CI now builds that command from
+  `server.json` the way a client does and runs it against the built wheel.
+- **A worktree's symlinked directory could run the approved command outside the
+  repository.** When a session in a git worktree started a server, rentctl carried the
+  project's subdirectory over to that worktree without re-checking that it stayed inside
+  it. A `frontend` symlinked elsewhere was followed. The start is now refused with
+  `CWD_ESCAPES_ROOT`, using the same containment check enrollment uses.
+- **Teardown could signal an unrelated process that inherited the watchdog's PID.**
+  The watchdog was sent SIGTERM by PID alone. After a reboot, leases survive and PIDs
+  do not. The watchdog's start time is now recorded and checked before any signal; a
+  lease written by 1.0.1, which has no start time, is never signalled — removing the
+  lease already makes a live watchdog exit on its next check. Skipped signals are
+  logged as `watchdog_signal_skipped`.
+- **`rent down app --all` also stopped `app--v2`.** A project's leases were found by a
+  filename prefix, and project names may contain `--`. Leases are now matched by their
+  parsed project name.
+- **Servers listening only on IPv6 loopback read as unreachable and unhealthy.** Node 17+
+  resolves `localhost` to `::1` first on macOS, so a Vite server on defaults was reported
+  as "not on loopback, http://localhost will not reach it" — which was false. Readiness
+  and health now try both `127.0.0.1` and `::1`.
+- **`rent doctor` warned "no rentctl hooks" for projects the plugin wires.** It read only
+  `settings.local.json`. It now reports where each project's hooks come from — plugin,
+  settings, or both — and whether the plugin is actually enabled, with "cannot tell" as
+  its own answer.
+- **A plugin-only install silently did nothing.** Without `uv tool install rentctl`, the
+  plugin's hooks exited 127 and nobody saw. Every session now starts with a warning that
+  session-end cleanup is off and the command that fixes it; the session-end hook exits
+  with the same message.
+- **The MCP handshake reported the MCP SDK's version** (`1.30.0`) as the server's. It now
+  reports rentctl's.
+
+### Added
+
+- **`rent --version`.** A tool that stops processes should be able to say which version
+  of it did.
+- **`SECURITY.md`** (private vulnerability reporting) and **`CONTRIBUTING.md`** (how to run
+  the suite, and why tests must use isolated state).
+
+### Changed
+
+- **The README now states the limits plainly:** approval pins the command, not the code
+  it runs; crash cleanup relies on expiry and sweep on a ~60 s watchdog interval; two
+  sessions in one checkout share one environment and the first to end stops it;
+  squatters are reported under advisory enforcement and **are** stopped under strict;
+  "verified free" means free as far as this user can see. The plugin README now opens
+  with a user quickstart.
 
 ## [1.0.1] — 2026-09-03
 

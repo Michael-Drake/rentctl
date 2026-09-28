@@ -27,6 +27,12 @@ running an approved command somewhere unverified, and every refusal carries a
 reason so a caller can tell "did not need re-rooting" from "could not verify"
 (the `declare-what-a-check-assumes` habit).
 
+One case is **not** a fallback: a proven sibling worktree whose carried-over
+subdirectory resolves *outside* that worktree (a symlinked ``frontend/``). That
+raises ``CWD_ESCAPES_ROOT`` (WI-0068). The caller asked for its lane and the lane
+is misconfigured; serving the main checkout instead would be the silent
+wrong-bytes failure described above, so the refusal is loud.
+
 Why the approved-command pin is *not* re-checked against the lane
 ----------------------------------------------------------------
 Re-rooting stays inside the repository the operator enrolled, so it does not
@@ -47,6 +53,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+
+from .containment import CwdEscapesRoot, resolve_within
 
 _GIT_TIMEOUT_S = 5.0
 
@@ -152,7 +160,24 @@ def resolve_spawn_cwd(
     except ValueError:  # pragma: no cover - defensive; toplevel always contains cwd
         return SpawnTarget(enrolled, False, "enrolled directory is outside its own worktree")
 
-    candidate = Path(caller_root) / rel
+    # Same repository is not the same as same directory tree. A lane can replace
+    # `frontend/` with a symlink to anywhere, and `is_dir()` follows it — so the
+    # carried-over path is resolved and held inside the verified caller root by
+    # the same validator enrollment uses (WI-0068). An escape is an error, not a
+    # fallback: quietly serving the main checkout is the silent wrong-bytes
+    # failure this module exists to prevent. The check-then-spawn window this
+    # leaves (TOCTOU) is documented on `resolve_within`.
+    try:
+        candidate = resolve_within(caller_root, rel)
+    except CwdEscapesRoot as exc:
+        raise CwdEscapesRoot(
+            f"refusing to re-root {enrolled_cwd!r} onto the caller's worktree "
+            f"{caller_root}: {rel.as_posix()!r} there resolves to "
+            f"{exc.target if exc.target is not None else 'an unresolvable path'}, "
+            f"outside that worktree. Fix or remove the symlink in the lane.",
+            root=exc.root,
+            target=exc.target,
+        ) from None
     if not candidate.is_dir():
         # A lane that does not carry the subdirectory (branch predates it, sparse
         # checkout) must not be spawned into — the command would run somewhere

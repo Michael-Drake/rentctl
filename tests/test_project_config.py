@@ -175,6 +175,21 @@ def test_cwd_may_not_escape_the_repo(tmp_path):
     assert ei.value.code == PROJECT_CONFIG_INVALID
 
 
+def test_cwd_may_not_escape_through_a_symlink(tmp_path):
+    """The case the syntactic '..' check cannot see: a repo-relative cwd whose
+    directory is a symlink out of the repo. Enrollment and worktree re-rooting
+    share one validator (WI-0068) so the two cannot drift apart."""
+    repo, outside = tmp_path / "repo", tmp_path / "outside"
+    repo.mkdir()
+    outside.mkdir()
+    (repo / "web").symlink_to(outside, target_is_directory=True)
+    write(repo, GOOD.replace('cwd = "."', 'cwd = "web"'))
+    with pytest.raises(DevctlError) as ei:
+        load(repo).resolve(repo)
+    assert ei.value.code == PROJECT_CONFIG_INVALID
+    assert "resolves outside the project" in ei.value.message
+
+
 def test_cwd_may_not_be_absolute(tmp_path):
     write(tmp_path, GOOD.replace('cwd = "."', 'cwd = "/etc"'))
     with pytest.raises(DevctlError) as ei:

@@ -81,7 +81,12 @@ dev = [
 rent = "rentctl.cli:main"
 rent-watchdog = "rentctl.watchdog:main"
 rent-mcp = "rentctl.mcp_server:main"
-devctl = "rentctl.cli:main"
+# The MCP server again, under the distribution's own name, for the MCP registry
+# (WI-0067). A registry client runs `uvx rentctl@<version>`, and uvx looks for an
+# executable named after the package. Pointing it at the MCP server rather than
+# the CLI is what lets server.json carry no arguments at all.
+rentctl = "rentctl.mcp_server:main"
+devctl ="rentctl.cli:main"
 devctl-watchdog = "rentctl.watchdog:main"
 devctl-mcp = "rentctl.mcp_server:main"
 

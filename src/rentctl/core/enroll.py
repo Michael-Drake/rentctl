@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .containment import CwdEscapesRoot, resolve_within
 from .errors import (
     CANNOT_ADOPT,
     CMD_CHANGED,
@@ -149,10 +150,12 @@ def adoption_candidates(root: Path, registry: Registry) -> list[str]:
 
 
 def _within(path: Path, root: Path) -> bool:
+    # The shared containment rule (WI-0068); here a refusal is a "no", not an error.
     try:
-        return path.resolve().is_relative_to(root)
-    except (OSError, ValueError):
+        resolve_within(root, path)
+    except CwdEscapesRoot:
         return False
+    return True
 
 
 def derive_config(root: Path, entry: RegistryEntry) -> ProjectConfig:

@@ -26,6 +26,7 @@ UNKNOWN_PROFILE = "UNKNOWN_PROFILE"      # profile not in the project's registry
 PROFILE_MISMATCH = "PROFILE_MISMATCH"    # a DIFFERENT profile is already leased to this cwd
 LEASE_INVALID = "LEASE_INVALID"          # lease file present but unparseable
 INVALID_CWD = "INVALID_CWD"              # --cwd was passed but empty — an unexpanded shell variable
+CWD_ESCAPES_ROOT = "CWD_ESCAPES_ROOT"    # a spawn directory resolves outside its verified worktree (WI-0068)
 INTERNAL = "INTERNAL"                    # catch-all for an unexpected failure
 
 # --- enrollment (ADR-0002) and command pinning (ADR-0003) -----------------

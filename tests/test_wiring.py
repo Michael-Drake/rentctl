@@ -7,8 +7,12 @@ breaks the project it was meant to enroll.
 
 from __future__ import annotations
 
+import configparser
 import json
+import re
+import subprocess
 import tomllib
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -480,10 +484,120 @@ def test_the_checked_in_manifest_matches_what_wiring_renders():
     assert MANIFEST_PATH.read_text() == wiring.render_plugin_manifest()
 
 
-def test_the_manifest_hooks_are_the_same_object_init_writes():
+def _plugin_command(event):
+    return wiring.plugin_manifest()["hooks"][event][0]["hooks"][0]["command"]
+
+
+def _init_command(event):
+    return wiring.hooks_fragment()[event][0]["hooks"][0]["command"]
+
+
+def test_the_manifest_hooks_run_the_same_commands_init_writes():
+    """The plugin wraps each hook in a CLI-present guard (ADR-0015), and the
+    guarded branch must be the `init` command verbatim — two delivery paths, one
+    teardown. Everything but the command is identical."""
     manifest = wiring.plugin_manifest()
-    assert manifest["hooks"] == wiring.hooks_fragment()
+    init = wiring.hooks_fragment()
+    assert set(manifest["hooks"]) == set(init)
+    for event in init:
+        assert f"then {_init_command(event)}; else" in _plugin_command(event)
+        plugin_hook = dict(manifest["hooks"][event][0]["hooks"][0], command=None)
+        init_hook = dict(init[event][0]["hooks"][0], command=None)
+        assert plugin_hook == init_hook
+        assert manifest["hooks"][event][0]["matcher"] == init[event][0]["matcher"]
     assert manifest["mcpServers"][wiring.SERVER_NAME] == wiring.mcp_fragment()
+
+
+def test_the_init_hooks_stay_bare_so_ownership_still_matches():
+    """The guard is the plugin's alone. `_group_is_ours` keys on the first
+    token; an `if` there would make every enrolled project's hook look foreign
+    to the next `init`, which would then append a second copy."""
+    for event, groups in wiring.hooks_fragment().items():
+        assert wiring._group_is_ours(groups[0]), event
+        assert _init_command(event).split()[0] == wiring.COMMAND
+
+
+# --- a plugin-only install says so when the CLI is missing (WI-0071) -----
+
+def test_the_session_start_hook_checks_for_the_cli_and_names_the_fix():
+    command = _plugin_command("SessionStart")
+    assert command.startswith(f"if command -v {wiring.COMMAND} >/dev/null 2>&1; then ")
+    assert "systemMessage" in command
+    assert wiring.INSTALL_COMMAND in command
+    assert wiring.INSTALL_COMMAND == "uv tool install rentctl"
+
+
+def test_the_session_end_hook_checks_for_the_cli_and_names_the_fix():
+    command = _plugin_command("SessionEnd")
+    assert command.startswith(f"if command -v {wiring.COMMAND} >/dev/null 2>&1; then ")
+    assert "exit 2" in command
+    assert wiring.INSTALL_COMMAND in command
+
+
+def _run_hook(command, bindir, project_dir):
+    """Run a generated hook exactly as Claude Code does on macOS/Linux — `sh -c`
+    — with PATH reduced to ``bindir``. `sh` itself is named by absolute path so
+    the reduced PATH cannot stop the shell from starting; everything the missing
+    branch needs is a builtin."""
+    return subprocess.run(
+        ["/bin/sh", "-c", command],
+        env={"PATH": str(bindir), "CLAUDE_PROJECT_DIR": str(project_dir)},
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+
+def test_session_start_without_the_cli_tells_the_user(tmp_path):
+    """The hook, executed, with no `rent` anywhere on PATH. `systemMessage` is
+    the field Claude Code shows the USER; plain stdout on SessionStart reaches
+    only the model. So the output must be one JSON object carrying it."""
+    empty = tmp_path / "bin"
+    empty.mkdir()
+    proc = _run_hook(_plugin_command("SessionStart"), empty, tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    message = out["systemMessage"]
+    assert "uv tool install rentctl" in message
+    assert "cleanup is OFF" in message
+    assert out["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert "uv tool install rentctl" in out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_session_end_without_the_cli_fails_loudly(tmp_path):
+    """SessionEnd discards JSON, so exit 2 + stderr is the only route to the
+    user. Before this it exited 127 with a shell's "not found"."""
+    empty = tmp_path / "bin"
+    empty.mkdir()
+    proc = _run_hook(_plugin_command("SessionEnd"), empty, tmp_path)
+    assert proc.returncode == 2
+    assert "uv tool install rentctl" in proc.stderr
+    assert proc.stdout == ""
+
+
+def _fake_rent(bindir):
+    """A stand-in `rent` that records its argv. Never the real one: these tests
+    must not run teardown against anything."""
+    bindir.mkdir()
+    fake = bindir / wiring.COMMAND
+    fake.write_text('#!/bin/sh\nprintf "%s|" "$@"\n')
+    fake.chmod(0o755)
+
+
+def test_session_start_with_the_cli_runs_the_sweep(tmp_path):
+    _fake_rent(tmp_path / "bin")
+    proc = _run_hook(_plugin_command("SessionStart"), tmp_path / "bin", tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "sweep|"
+
+
+def test_session_end_with_the_cli_runs_the_teardown_for_this_project(tmp_path):
+    _fake_rent(tmp_path / "bin")
+    project = tmp_path / "my project"
+    proc = _run_hook(_plugin_command("SessionEnd"), tmp_path / "bin", project)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == f"down|--all|--cwd|{project}|--reason|session-end|"
 
 
 def test_the_manifest_hooks_are_not_wrapped_in_a_settings_file_envelope():
@@ -600,15 +714,100 @@ def test_the_marker_names_the_server_it_publishes():
     assert wiring.registry_manifest()["name"] == wiring.REGISTRY_NAME
 
 
-def test_the_registry_entry_names_the_console_script_not_the_distribution():
-    """`rent-mcp` is the executable; `rentctl` is the distribution. A client that
-    assumes they match runs nothing, which is why runtimeHint and the explicit
-    --from spelling are both present."""
+def registry_client_argv(package: dict, pin: str = "@") -> list[str]:
+    """The argv a registry client builds from one `packages[]` entry.
+
+    Modelled on VS Code's `McpManagementService` (the pypi branch of
+    `getMcpServerConfigurationFromManifest`), not on our reading of the schema:
+    runtime, then runtimeArguments, then `identifier@version`, then
+    packageArguments. The order is the whole point -- 1.0.1's `--from rentctl
+    rent-mcp` sat in packageArguments, so it landed AFTER the identifier, where
+    uvx reads it as arguments to an executable named `rentctl` that did not exist.
+    `pin` is `@` as VS Code writes it; `==` is the other spelling uvx accepts.
+    """
+    def render(args):
+        out = []
+        for arg in args:
+            if arg["type"] == "named":
+                out.append(arg["name"])
+                if "value" in arg:
+                    out.append(arg["value"])
+            else:
+                out.append(arg["value"])
+        return out
+
+    assert package["registryType"] == "pypi"
+    return [
+        package.get("runtimeHint", "uvx"),
+        *render(package.get("runtimeArguments", [])),
+        f"{package['identifier']}{pin}{package['version']}",
+        *render(package.get("packageArguments", [])),
+    ]
+
+
+def uvx_executable(argv: list[str]) -> str:
+    """The console script uvx will look for.
+
+    uvx stops parsing its own options at the first positional; everything after
+    that is argv for the command. So `--from` counts only BEFORE the target, and
+    then the target is the command name. Otherwise the target is a package spec
+    whose name doubles as the command. Honouring a `--from` found anywhere is
+    exactly the misreading 1.0.1's entry was written under.
+    """
+    rest = argv[1:]
+    if rest and rest[0] == "--from":
+        return rest[2]
+    return re.split(r"[@=<>!~]", rest[0], maxsplit=1)[0]
+
+
+def _declared_scripts() -> dict[str, str]:
+    with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
+        return tomllib.load(fh)["project"]["scripts"]
+
+
+def test_a_registry_client_command_names_an_executable_the_package_ships():
+    """WI-0067. The registry entry is only right if the command a client builds
+    from it runs something. 1.0.1's did not: `uvx rentctl@1.0.1 --from rentctl
+    rent-mcp` exits 1 with "An executable named 'rentctl' is not provided"."""
     package = wiring.registry_manifest()["packages"][0]
-    args = package["packageArguments"]
+    for pin in ("@", "=="):
+        argv = registry_client_argv(package, pin)
+        assert uvx_executable(argv) in _declared_scripts(), argv
+
+
+def test_the_registry_command_is_the_bare_package_and_nothing_else():
+    """The sturdiest shape: `uvx rentctl@<version>` with no arguments, because
+    the distribution ships a console script under its own name. No argument
+    ordering can go wrong when there are no arguments."""
+    package = wiring.registry_manifest()["packages"][0]
     assert package["runtimeHint"] == "uvx"
-    assert {"type": "named", "name": "--from", "value": wiring.SERVER_NAME} in args
-    assert {"type": "positional", "value": f"{wiring.COMMAND}-mcp"} in args
+    assert "packageArguments" not in package
+    assert "runtimeArguments" not in package
+    assert registry_client_argv(package) == ["uvx", f"{wiring.SERVER_NAME}@{rentctl.__version__}"]
+
+
+def test_the_distribution_named_script_starts_the_mcp_server():
+    """`rentctl` must be the MCP server, same entry point as `rent-mcp` -- the
+    registry launches it expecting an MCP handshake on stdio."""
+    scripts = _declared_scripts()
+    assert scripts[wiring.SERVER_NAME] == scripts[f"{wiring.COMMAND}-mcp"] == "rentctl.mcp_server:main"
+
+
+def test_the_built_wheel_ships_the_script_the_registry_runs(tmp_path):
+    """pyproject is what we asked for; the wheel's entry_points.txt is what uvx
+    actually reads. Build one and check the registry's executable is in it."""
+    builders = pytest.importorskip("hatchling.builders.wheel")
+    wheel = Path(next(iter(builders.WheelBuilder(str(REPO_ROOT)).build(
+        directory=str(tmp_path), versions=["standard"]
+    ))))
+    with zipfile.ZipFile(wheel) as zf:
+        name = next(n for n in zf.namelist() if n.endswith(".dist-info/entry_points.txt"))
+        parser = configparser.ConfigParser()
+        parser.read_string(zf.read(name).decode())
+    shipped = dict(parser["console_scripts"])
+    argv = registry_client_argv(wiring.registry_manifest()["packages"][0])
+    assert shipped[uvx_executable(argv)] == "rentctl.mcp_server:main"
+    assert shipped[f"{wiring.COMMAND}-mcp"] == "rentctl.mcp_server:main"
 
 
 def test_the_manifest_keeps_non_ascii_readable():
@@ -682,6 +881,97 @@ def test_a_local_install_does_not_count_with_no_project_to_compare(tmp_path):
 def test_another_plugin_is_not_ours(tmp_path):
     write_register(tmp_path, {"something-else@rentctl": [{"scope": "user"}]})
     assert wiring.plugin_installed(tmp_path) is False
+
+
+# --- installed AND enabled, three-valued (WI-0070) -------------------------
+
+def _state(home, project=None, managed=()):
+    return wiring.plugin_state(home, project, managed_files=tuple(managed))
+
+
+def _settings(path, enabled):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"enabledPlugins": enabled}))
+
+
+def test_state_absent_register_is_a_definite_no(tmp_path):
+    assert _state(tmp_path).active is False
+
+
+def test_state_unreadable_register_is_cannot_tell(tmp_path):
+    """Where `plugin_installed` folds this into False (fail-safe for init),
+    `plugin_state` must not — doctor has no safe direction to fold into."""
+    (tmp_path / "plugins").mkdir(parents=True)
+    (tmp_path / "plugins" / wiring.INSTALLED_PLUGINS_FILE).write_text("{not json")
+    assert _state(tmp_path).active is None
+    (tmp_path / "plugins" / wiring.INSTALLED_PLUGINS_FILE).write_text('{"plugins": []}')
+    assert _state(tmp_path).active is None
+
+
+def test_state_installed_for_another_project_is_no(tmp_path):
+    write_register(tmp_path, {"rentctl@rentctl": [{"scope": "local", "projectPath": "/elsewhere"}]})
+    assert _state(tmp_path, tmp_path / "mine").active is False
+
+
+def test_state_enabled_by_default_when_no_scope_says(tmp_path):
+    write_register(tmp_path, {"rentctl@rentctl": [{"scope": "user"}]})
+    state = _state(tmp_path)
+    assert state.active is True
+    assert "default" in state.detail
+
+
+def test_state_user_disable_is_honoured(tmp_path):
+    write_register(tmp_path, {"rentctl@rentctl": [{"scope": "user"}]})
+    _settings(tmp_path / "settings.json", {"rentctl@rentctl": False})
+    assert _state(tmp_path).active is False
+
+
+def test_state_disable_for_another_marketplace_key_does_not_count(tmp_path):
+    write_register(tmp_path, {"rentctl@rentctl": [{"scope": "user"}]})
+    _settings(tmp_path / "settings.json", {"rentctl@someone-else": False, "other@rentctl": False})
+    assert _state(tmp_path).active is True
+
+
+def test_state_managed_outranks_every_other_scope(tmp_path):
+    write_register(tmp_path, {"rentctl@rentctl": [{"scope": "user"}]})
+    project = tmp_path / "proj"
+    _settings(project / ".claude" / "settings.local.json", {"rentctl@rentctl": True})
+    managed = tmp_path / "managed-settings.json"
+    _settings(managed, {"rentctl@rentctl": False})
+    assert _state(tmp_path, project, [managed]).active is False
+
+
+def test_state_project_settings_outrank_user(tmp_path):
+    write_register(tmp_path, {"rentctl@rentctl": [{"scope": "user"}]})
+    project = tmp_path / "proj"
+    _settings(tmp_path / "settings.json", {"rentctl@rentctl": True})
+    _settings(project / ".claude" / "settings.json", {"rentctl@rentctl": False})
+    assert _state(tmp_path, project).active is False
+
+
+def test_state_unreadable_settings_on_the_path_is_cannot_tell(tmp_path):
+    write_register(tmp_path, {"rentctl@rentctl": [{"scope": "user"}]})
+    (tmp_path / "settings.json").write_text("{not json")
+    assert _state(tmp_path).active is None
+
+
+def test_state_malformed_enabled_plugins_is_cannot_tell(tmp_path):
+    write_register(tmp_path, {"rentctl@rentctl": [{"scope": "user"}]})
+    (tmp_path / "settings.json").write_text(json.dumps({"enabledPlugins": ["rentctl@rentctl"]}))
+    assert _state(tmp_path).active is None
+    _settings(tmp_path / "settings.json", {"rentctl@rentctl": "true"})
+    assert _state(tmp_path).active is None
+
+
+def test_state_settings_without_enabled_plugins_are_skipped(tmp_path):
+    write_register(tmp_path, {"rentctl@rentctl": [{"scope": "user"}]})
+    (tmp_path / "settings.json").write_text(json.dumps({"theme": "dark"}))
+    assert _state(tmp_path).active is True
+
+
+def test_state_default_managed_path_is_platform_specific():
+    (path,) = wiring.MANAGED_SETTINGS_FILES
+    assert path.name == "managed-settings.json"
 
 
 # ---------------------------------------------------------------------------

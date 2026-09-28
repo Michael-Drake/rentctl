@@ -72,6 +72,13 @@ DOWN = "down"
 # by `events`. A separate file would be a second thing to remember to look at.
 FALSE_KILL = "false_kill"
 
+# A watchdog SIGTERM that teardown declined to send because it could not prove
+# the pid was still our watchdog (WI-0069). Not a ``down``: the teardown it
+# belongs to is recorded separately, and this must not move the kill counts.
+# It exists so a refusal is evidence, not silence — "rentctl re-checks before
+# killing anything" is a claim the log should be able to show being exercised.
+WATCHDOG_SIGNAL_SKIPPED = "watchdog_signal_skipped"
+
 # --- teardown reasons, and the cleanup layer each one evidences (spec §8) ---
 
 EXPLICIT = "explicit"            # layer 1 — the LLM/human called down on a named project

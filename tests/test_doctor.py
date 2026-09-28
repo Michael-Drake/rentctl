@@ -17,8 +17,20 @@ from pathlib import Path
 
 import pytest
 
-from rentctl.core import doctor
+from conftest import install_plugin
+
+from rentctl.core import doctor, wiring
 from rentctl.core.doctor import FAIL, OK, UNKNOWN, WARN, Check, Report
+
+
+@pytest.fixture(autouse=True)
+def no_real_claude_home(tmp_path, monkeypatch):
+    """Every hooks check now reads Claude Code's plugin register and settings.
+    Point the default `~/.claude` at an empty tmp dir, and drop the machine's
+    managed-settings file, so no test here answers differently on a machine
+    where the plugin really is installed — the developer's own, for one."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(wiring, "MANAGED_SETTINGS_FILES", ())
 
 
 def runner_returning(code: int, out: str = "", err: str = ""):
@@ -145,6 +157,161 @@ def test_unparseable_settings_is_unknown_not_ok(tmp_path):
     path.write_text("{not json")
     check = doctor.check_project_hooks("weather", tmp_path)
     assert check.status == UNKNOWN
+
+
+# --- which source wires the hooks (WI-0070) -------------------------------
+
+
+def _claude(tmp_path: Path, *, enabled: dict | None = None) -> Path:
+    """A fake `~/.claude` with the plugin installed at user scope."""
+    home = tmp_path / "claude"
+    install_plugin(home, name="rentctl")
+    if enabled is not None:
+        (home / "settings.json").write_text(json.dumps({"enabledPlugins": enabled}))
+    return home
+
+
+def test_plugin_only_is_ok_with_source_plugin(tmp_path, monkeypatch):
+    """**The false alarm WI-0070 is about.** The published install path: plugin
+    enabled at user scope, and `init` deliberately wrote no hooks. Reading only
+    settings.local.json warned "layer 3 alone" here."""
+    monkeypatch.setattr(doctor.shutil, "which", lambda _c: "/usr/local/bin/rent")
+    check = doctor.check_project_hooks("weather", tmp_path, claude_home=_claude(tmp_path))
+    assert check.status == OK
+    assert check.source == doctor.SOURCE_PLUGIN
+    assert "plugin" in check.detail
+
+
+def test_plugin_only_with_no_cli_fails(tmp_path, monkeypatch):
+    """The plugin supplying hooks proves nothing if the command they call is
+    missing (WI-0071) — the outage's signature again, one layer over."""
+    monkeypatch.setattr(doctor.shutil, "which", lambda _c: None)
+    check = doctor.check_project_hooks("weather", tmp_path, claude_home=_claude(tmp_path))
+    assert check.status == FAIL
+    assert check.source == doctor.SOURCE_PLUGIN
+    assert wiring.INSTALL_COMMAND in check.detail
+
+
+def test_settings_only_is_ok_with_source_settings(tmp_path, monkeypatch):
+    _write_settings(tmp_path, ["rent down --all --reason session-end"])
+    monkeypatch.setattr(doctor.shutil, "which", lambda _c: "/usr/local/bin/rent")
+    check = doctor.check_project_hooks("weather", tmp_path, claude_home=tmp_path / "no-plugins")
+    assert check.status == OK
+    assert check.source == doctor.SOURCE_SETTINGS
+
+
+def test_plugin_and_settings_is_double_wired_warn(tmp_path, monkeypatch):
+    """Claude Code keeps a plugin's copy of a handler separate from a settings
+    copy, so both fire. Teardown is idempotent under the project lock, so this
+    is a WARN — redundancy, not breakage — and the detail says why."""
+    _write_settings(tmp_path, ["rent down --all --reason session-end"])
+    monkeypatch.setattr(doctor.shutil, "which", lambda _c: "/usr/local/bin/rent")
+    check = doctor.check_project_hooks("weather", tmp_path, claude_home=_claude(tmp_path))
+    assert check.status == WARN
+    assert check.source == doctor.SOURCE_BOTH
+    assert "double-wired" in check.detail
+    assert "idempotent" in check.detail
+
+
+def test_neither_source_keeps_the_layer_3_warning(tmp_path, monkeypatch):
+    _write_settings(tmp_path, ["some-other-tool --flag"])
+    monkeypatch.setattr(doctor.shutil, "which", lambda _c: "/usr/local/bin/rent")
+    check = doctor.check_project_hooks("weather", tmp_path, claude_home=tmp_path / "no-plugins")
+    assert check.status == WARN
+    assert check.source == doctor.SOURCE_NONE
+    assert "layer 3 alone" in check.detail
+
+
+def test_a_disabled_plugin_supplies_nothing(tmp_path, monkeypatch):
+    """`claude plugin disable` leaves the install register alone. Counting an
+    installed-but-disabled plugin would certify hooks that never run."""
+    monkeypatch.setattr(doctor.shutil, "which", lambda _c: "/usr/local/bin/rent")
+    home = _claude(tmp_path, enabled={"rentctl@rentctl": False})
+    check = doctor.check_project_hooks("weather", tmp_path, claude_home=home)
+    assert check.status == WARN
+    assert check.source == doctor.SOURCE_NONE
+    assert "disabled" in check.detail
+
+
+def test_a_project_scope_can_reenable_what_the_user_disabled(tmp_path, monkeypatch):
+    """The most specific scope with an entry wins."""
+    monkeypatch.setattr(doctor.shutil, "which", lambda _c: "/usr/local/bin/rent")
+    home = _claude(tmp_path, enabled={"rentctl@rentctl": False})
+    local = tmp_path / ".claude" / "settings.local.json"
+    local.parent.mkdir(parents=True)
+    local.write_text(json.dumps({"enabledPlugins": {"rentctl@rentctl": True}}))
+    check = doctor.check_project_hooks("weather", tmp_path, claude_home=home)
+    assert check.status == OK
+    assert check.source == doctor.SOURCE_PLUGIN
+
+
+def test_an_unreadable_plugin_register_is_unknown_not_ok(tmp_path, monkeypatch):
+    """`declare-what-a-check-assumes`: with no settings hooks, whether anything
+    is wired hinges on the plugin — and we could not read it."""
+    monkeypatch.setattr(doctor.shutil, "which", lambda _c: "/usr/local/bin/rent")
+    home = tmp_path / "claude"
+    (home / "plugins").mkdir(parents=True)
+    (home / "plugins" / wiring.INSTALLED_PLUGINS_FILE).write_text("{not json")
+    check = doctor.check_project_hooks("weather", tmp_path, claude_home=home)
+    assert check.status == UNKNOWN
+    assert "cannot tell" in check.detail
+
+
+def test_settings_hooks_with_an_unreadable_plugin_state_warn_not_ok(tmp_path, monkeypatch):
+    """The hooks are wired; only the double-wiring is in doubt. Not OK, because
+    "cannot tell" is never folded into OK — and not UNKNOWN, because what is in
+    doubt is itself only WARN-grade."""
+    _write_settings(tmp_path, ["rent down --all --reason session-end"])
+    monkeypatch.setattr(doctor.shutil, "which", lambda _c: "/usr/local/bin/rent")
+    home = _claude(tmp_path, enabled={"rentctl@rentctl": "yes"})
+    check = doctor.check_project_hooks("weather", tmp_path, claude_home=home)
+    assert check.status == WARN
+    assert "cannot tell" in check.detail
+    assert check.source == doctor.SOURCE_SETTINGS
+
+
+def test_the_plugin_is_not_consulted_for_another_runtime(tmp_path, monkeypatch):
+    from rentctl.core.runtimes import GEMINI_CLI
+
+    monkeypatch.setattr(doctor.shutil, "which", lambda _c: "/usr/local/bin/rent")
+    check = doctor.check_project_hooks(
+        "weather", tmp_path, binding=GEMINI_CLI, claude_home=_claude(tmp_path)
+    )
+    assert check.source == doctor.SOURCE_NONE
+    assert check.status == WARN
+
+
+def test_as_dict_carries_the_source():
+    assert Check("a", OK, "", source="plugin").as_dict()["source"] == "plugin"
+    assert "source" not in Check("a", OK, "").as_dict()
+
+
+def test_diagnose_sees_the_plugin(devctl_home, write_registry, tmp_path, monkeypatch):
+    """End to end: the registry's project has no settings hooks and the plugin
+    is enabled — the report must say OK/plugin, not warn."""
+    source = tmp_path / "webapp"
+    source.mkdir()
+    write_registry(
+        {
+            "projects": {
+                "webapp": {
+                    "block": 5180,
+                    "runner": "process",
+                    "source_dir": str(source),
+                    "profiles": {
+                        "default": {"cmd": "npm run dev", "cwd": "/tmp/webapp", "port_env": "PORT"}
+                    },
+                }
+            }
+        }
+    )
+    monkeypatch.setattr(doctor.shutil, "which", lambda _c: "/usr/local/bin/rent")
+    report = doctor.diagnose(
+        devctl_home, runner=runner_returning(0, '{"ok": true}'), claude_home=_claude(tmp_path)
+    )
+    (hooks,) = [c for c in report.checks if c.name == "hooks:webapp"]
+    assert hooks.status == OK
+    assert hooks.as_dict()["source"] == "plugin"
 
 
 # --- the registry check ---------------------------------------------------

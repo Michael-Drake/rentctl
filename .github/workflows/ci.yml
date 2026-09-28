@@ -17,7 +17,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `ci/**` lets a release candidate be proven on this exact matrix BEFORE it is
+    # pushed to main: the staged tree is pushed to a ci/ branch of a private mirror,
+    # byte-identical to what will ship, including this file.
+    branches: [main, "ci/**"]
   pull_request:
   workflow_dispatch:
 
@@ -64,3 +67,44 @@ jobs:
         # shell are thin wrappers over it and are covered by the integration tests
         # rather than this number.
         run: uv run --extra dev pytest -q -rs --cov --cov-fail-under=90
+
+  wheel:
+    # The job above tests the SOURCE. This one tests the ARTIFACT: build the wheel,
+    # install it into a clean venv, run the same suite against the installed package,
+    # then run the install smoke (scripts/wheel_smoke.py) — `uv tool install`, `rent
+    # --version`, `rent doctor`, `rent-mcp`, and the MCP registry's own client-built
+    # `uvx` command. 1.0.1 shipped a registry entry whose command could not start the
+    # server; every source-tree check was green, because none of them ran the wheel.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Build the wheel
+        run: uv build --wheel --out-dir dist
+
+      - name: Install the wheel into a clean venv
+        run: |
+          uv venv --python ${{ matrix.python-version }} .wheel-venv
+          uv pip install --python .wheel-venv dist/*.whl pytest hatchling
+
+      - name: Prove the suite will import the INSTALLED package, not src/
+        # pyproject puts src/ on pytest's path for the bare-checkout gate; the run
+        # below overrides it to empty. This step is the receipt that the override
+        # took: if rentctl resolves under src/, the job is testing the wrong thing.
+        run: .wheel-venv/bin/python -P -c "import rentctl, sys; p = rentctl.__file__; print(p); sys.exit('src' + '/rentctl' in p)"
+
+      - name: Run the suite against the installed wheel
+        run: .wheel-venv/bin/python -P -m pytest -q -rs -o pythonpath= -p no:cacheprovider
+
+      - name: Install smoke from the built wheel
+        run: .wheel-venv/bin/python scripts/wheel_smoke.py dist
