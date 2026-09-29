@@ -7,8 +7,9 @@ An MCP server + CLI that leases dev environments so a dev server can never
 outlive the work that needed it. Every environment is leased: it dies at
 session end, at lease expiry, or on request — whichever comes first.
 
-This package is three thin shells (``mcp_server``, ``cli``, ``watchdog``)
-over one core (``rentctl.core``). See ``README.md`` for the user-facing
+This package is thin shells (``mcp_server``, ``cli``, the per-lease
+``supervisor``, and the deprecated 1.0.x ``watchdog``) over one core
+(``rentctl.core``). See ``README.md`` for the user-facing
 contract, including the security model.
 """
 

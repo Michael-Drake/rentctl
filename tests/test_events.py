@@ -363,6 +363,12 @@ def test_summarize_empty_is_well_formed():
         "layers": {},
         "kills": 0,
         "lease_cleanups": 0,
+        "supervision": {
+            "stop_requested": 0,
+            "cleanup_incomplete": 0,
+            "supervisor_lost": 0,
+            "duplicate_downs": 0,
+        },
         "sessions": {
             "distinct": 0,
             "attributed_leases": 0,
@@ -446,6 +452,111 @@ def test_summarize_ignores_a_down_with_no_layer(log):
     summary = summarize(log.read())
     assert summary["counts"]["down"] == 1
     assert summary["layers"] == {}
+
+
+# --- the supervisor vocabulary (ADR-0016 §13) -------------------------------
+
+# Rows exactly as 1.0.1 wrote them: no generation, no actor, no §13 kinds.
+_LOG_1_0_X = [
+    {"ts": "2026-09-01T09:00:00-05:00", "event": "up", "project": "webapp", "op": "up",
+     "profile": "default", "port": 5180, "pid": 101, "session": "s-1", "cwd": "/w",
+     "lease_expires": "2026-09-01T11:00:00-05:00", "already_running": False},
+    {"ts": "2026-09-01T09:30:00-05:00", "event": "down", "project": "webapp", "op": "down",
+     "reason": "explicit", "layer": 1, "reason_source": "declared", "killed": True,
+     "port": 5180, "pid": 101},
+    {"ts": "2026-09-01T10:00:00-05:00", "event": "down", "project": "webapp", "op": "down",
+     "reason": "session-end", "layer": 2, "reason_source": "inferred", "killed": True},
+    {"ts": "2026-09-01T11:00:00-05:00", "event": "down", "project": "api", "op": "watchdog",
+     "reason": "expiry", "layer": 3, "reason_source": "declared", "killed": True},
+    {"ts": "2026-09-01T12:00:00-05:00", "event": "down", "project": "api", "op": "sweep",
+     "reason": "sweep-dead", "layer": 4, "reason_source": "declared", "killed": False},
+    {"ts": "2026-09-01T12:05:00-05:00", "event": "up_failed", "project": "api", "op": "up",
+     "profile": "default", "error": "START_TIMEOUT"},
+    {"ts": "2026-09-01T12:10:00-05:00", "event": "false_kill", "project": "webapp",
+     "note": "x", "unmatched": True},
+]
+
+
+def _layers_block(summary: dict) -> dict:
+    return {k: (v["count"], v["declared"], v["inferred"], v["reasons"])
+            for k, v in summary["layers"].items()}
+
+
+def test_a_1_0_x_log_scores_exactly_as_before():
+    """The pilot gate is scored from logs 1.0.x wrote. The §13 changes must not
+    move a single number for them."""
+    s = summarize(_LOG_1_0_X)
+    assert _layers_block(s) == {
+        "1": (1, 1, 0, {"explicit": 1}),
+        "2": (1, 0, 1, {"session-end": 1}),
+        "3": (1, 1, 0, {"expiry": 1}),
+        "4": (1, 1, 0, {"sweep-dead": 1}),
+    }
+    assert s["kills"] == 3 and s["lease_cleanups"] == 1
+    assert s["false_kills"]["kills_in_window"] == 3
+    assert s["supervision"] == {
+        "stop_requested": 0, "cleanup_incomplete": 0, "supervisor_lost": 0, "duplicate_downs": 0,
+    }
+
+
+def test_a_supervised_log_counts_teardowns_once_and_requests_never(log, clock):
+    """A session-end that answered `pending` writes `stop_requested`; the
+    supervisor writes the one `down` when it verifies. That pair is ONE layer-2
+    teardown. A stop that left survivors is no teardown at all, and a helper
+    found dead is counted on its own."""
+    log.record(ev.STOP_REQUESTED, "webapp", generation="g1", op="down",
+               reason=ev.SESSION_END, reason_source=ev.DECLARED, requester_pid=7)
+    clock.advance(seconds=3)
+    log.record_down("webapp", op="down", reason=ev.SESSION_END, reason_source=ev.DECLARED,
+                    killed=True, cleanup=ev.CLEANUP_VERIFIED, escalated=True,
+                    generation="g1", actor=ev.ACTOR_SUPERVISOR)
+    # The same teardown reported a second time (for instance by a recovering
+    # reconciler racing the supervisor) is not a second teardown.
+    log.record_down("webapp", op="sweep", reason=ev.SESSION_END, reason_source=ev.DECLARED,
+                    killed=True, generation="g1", actor=ev.ACTOR_SWEEP)
+    log.record(ev.STOP_REQUESTED, "api", generation="g2", op="down",
+               reason=ev.EXPLICIT, reason_source=ev.DECLARED, requester_pid=8)
+    log.record_cleanup_incomplete("api", op="down", reason=ev.EXPLICIT,
+                                  reason_source=ev.DECLARED, survivors=[{"pid": 9}],
+                                  identity_ambiguous=False, escalated=True, generation="g2")
+    log.record(ev.SUPERVISOR_LOST, "db", generation="g3", state_before="running",
+               members="empty", detected_by="sweep")
+    log.record_down("db", op="sweep", reason=ev.SWEEP_DEAD, reason_source=ev.DECLARED,
+                    killed=False, generation="g3", actor=ev.ACTOR_SWEEP, supervisor_lost=True)
+    # A reason the supervisor added: counted as a teardown, credited to no layer.
+    log.record_down("cache", op="supervisor", reason=ev.LEASE_LOST, reason_source=ev.DECLARED,
+                    killed=True, generation="g4", actor=ev.ACTOR_SUPERVISOR)
+
+    s = summarize(log.read())
+    assert _layers_block(s) == {
+        "2": (1, 1, 0, {"session-end": 1}),
+        "4": (1, 1, 0, {"sweep-dead": 1}),
+    }
+    assert s["kills"] == 2          # g1 once, g4; the incomplete stop killed nothing
+    assert s["lease_cleanups"] == 1  # g3
+    assert s["supervision"] == {
+        "stop_requested": 2, "cleanup_incomplete": 1, "supervisor_lost": 1, "duplicate_downs": 1,
+    }
+    assert s["counts"]["down"] == 4  # raw rows stay visible in `counts`
+
+
+def test_a_down_row_marked_stop_failed_is_not_a_teardown():
+    """Pre-release 1.1 builds wrote a failed stop as `down{stop_failed: true}`.
+    It is shown in `counts` but credited to no layer and no kill."""
+    s = summarize([{"event": "down", "reason": "expiry", "layer": 3, "killed": True,
+                    "stop_failed": True}])
+    assert s["layers"] == {} and s["kills"] == 0 and s["lease_cleanups"] == 0
+    assert s["counts"] == {"down": 1}
+
+
+def test_the_layer_of_a_supervised_down_comes_from_its_reason_alone(log):
+    """A caller cannot pass a layer: a supervisor row says `layer` only because
+    its `reason` maps to one."""
+    log.record_down("webapp", op="down", reason=ev.EXPIRY, reason_source=ev.DECLARED,
+                    killed=True, generation="g9", actor=ev.ACTOR_SUPERVISOR, layer=1)
+    (row,) = log.read()
+    assert row["layer"] == 3
+    assert set(summarize([row])["layers"]) == {"3"}
 
 
 # --- parse_since ----------------------------------------------------------

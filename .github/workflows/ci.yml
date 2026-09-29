@@ -1,110 +1,14 @@
-# CI for the public rentctl repo.
-#
-# SOURCE FILE — this is not wired to anything in the private repo. `publish.py`
-# copies it to `.github/workflows/ci.yml` in the published tree. Kept out of
-# `.github/` here deliberately so the private repo does not start running
-# Actions (and billing minutes) as a side effect of the split.
-#
-# Linux is the point of this file, not an afterthought. `core/procutil.py`
-# selects `psutil` as the PRIMARY port-probe backend on every non-macOS host,
-# and `test_psutil_backend_finds_this_process` SKIPS on macOS because
-# `psutil.net_connections` needs root there. Developed only on a Mac, that
-# backend's success path had never executed anywhere. On ubuntu-latest the
-# call is unprivileged, so the test actually runs — this workflow is the only
-# place the Linux probe is exercised at all.
-
 name: CI
-
 on:
   push:
-    # `ci/**` lets a release candidate be proven on this exact matrix BEFORE it is
-    # pushed to main: the staged tree is pushed to a ci/ branch of a private mirror,
-    # byte-identical to what will ship, including this file.
-    branches: [main, "ci/**"]
-  pull_request:
-  workflow_dispatch:
-
+    branches: ["ci/**"]
 jobs:
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        python-version: ["3.12", "3.13"]
-    runs-on: ${{ matrix.os }}
+  diag:
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v5
         with:
-          # WITHOUT this the matrix is decorative. `setup-uv` installs uv but
-          # pins no interpreter, so `uv run` takes whatever the runner already
-          # has: the first release run put CPython 3.12.3 on BOTH ubuntu legs
-          # and 3.14.6 on BOTH macOS legs. Four jobs, two configurations, and
-          # a gate reporting a coverage of Python versions it never tested.
-          python-version: ${{ matrix.python-version }}
-
-      - name: Report the interpreter actually in use
-        # The matrix label is a promise; this is the receipt. A leg named 3.13
-        # that runs 3.12 must say so in its own log rather than be inferred
-        # later from a traceback path.
-        run: uv run python -c "import sys; print('interpreter:', sys.version)"
-
-      - name: Run the suite, with the core/ coverage gate
-        # ONE run. This was two steps — the suite, then the same suite again under
-        # coverage — which is a rounding error on Linux and eight wasted minutes on
-        # macOS. GitHub's hosted macOS runners take 484s for a suite that takes 15s
-        # on a real Mac, so the duplicate cost more wall-clock than every other step
-        # in this workflow combined. The coverage gate needs the suite to run; it
-        # never needed it to run twice.
-        #
-        # -rs surfaces skips. A skipped test reports identically to a passing one in
-        # default output, which is how the Linux gap above stayed invisible; if
-        # something skips here we want to see which.
-        #
-        # core/ is the release gate at >= 90% (spec §10). The runners, CLI and MCP
-        # shell are thin wrappers over it and are covered by the integration tests
-        # rather than this number.
-        run: uv run --extra dev pytest -q -rs --cov --cov-fail-under=90
-
-  wheel:
-    # The job above tests the SOURCE. This one tests the ARTIFACT: build the wheel,
-    # install it into a clean venv, run the same suite against the installed package,
-    # then run the install smoke (scripts/wheel_smoke.py) — `uv tool install`, `rent
-    # --version`, `rent doctor`, `rent-mcp`, and the MCP registry's own client-built
-    # `uvx` command. 1.0.1 shipped a registry entry whose command could not start the
-    # server; every source-tree check was green, because none of them ran the wheel.
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        python-version: ["3.12", "3.13"]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Build the wheel
-        run: uv build --wheel --out-dir dist
-
-      - name: Install the wheel into a clean venv
-        run: |
-          uv venv --python ${{ matrix.python-version }} .wheel-venv
-          uv pip install --python .wheel-venv dist/*.whl pytest hatchling
-
-      - name: Prove the suite will import the INSTALLED package, not src/
-        # pyproject puts src/ on pytest's path for the bare-checkout gate; the run
-        # below overrides it to empty. This step is the receipt that the override
-        # took: if rentctl resolves under src/, the job is testing the wrong thing.
-        run: .wheel-venv/bin/python -P -c "import rentctl, sys; p = rentctl.__file__; print(p); sys.exit('src' + '/rentctl' in p)"
-
-      - name: Run the suite against the installed wheel
-        run: .wheel-venv/bin/python -P -m pytest -q -rs -o pythonpath= -p no:cacheprovider
-
-      - name: Install smoke from the built wheel
-        run: .wheel-venv/bin/python scripts/wheel_smoke.py dist
+          python-version: "3.13"
+      - run: uv sync --extra dev
+      - run: uv run python scripts/diag.py

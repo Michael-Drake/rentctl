@@ -1,52 +1,65 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Michael Drake
 
-"""The ``process`` runner — v1, fully specified (spec §6.1).
+"""The ``process`` runner (spec §6.1, with ADR-0016 §4's semantics).
 
-Spawns a dev-server command in its **own process group** so teardown catches
-npm's child vite/node processes. Every kill is guarded by the PID-start-time
-check (§5.2): we re-verify the handle points at the same process before
-signalling, and again before escalating to SIGKILL. A recycled PID reads as
-dead and is never touched.
+Spawns a dev-server command in its **own session**, so everything it starts —
+npm's vite/node children, and their orphans once the shell exits — is findable
+by session id. The handle names that session (ADR-0016 §2).
+
+What changed from 1.0.x is what ``alive`` and ``stop`` *mean*. Both used to
+look only at the leader shell: ``stop`` returned the moment the shell died, so
+a child that ignored SIGTERM outlived the teardown, and ``alive`` read "npm
+exited, vite still holds the port" as dead (S1). Now ``alive`` means "the
+workload session has members" and ``stop`` runs the one stop algorithm
+(:func:`~rentctl.core.workload.stop_workload`) in recovery mode, returning a
+:class:`~rentctl.core.models.StopOutcome` instead of ``None``.
 """
 
 from __future__ import annotations
 
 import os
-import signal
 import subprocess
-import time
 from pathlib import Path
 
 from .. import procutil
-from ..models import ProcessHandle
+from ..models import SID_OWNER_WORKLOAD, ProcessHandle, StopOutcome
+from ..procutil import Membership, ProcessTable
 from ..registry import RegistryProfile
-
-_TERM_GRACE_S = 10.0   # SIGTERM → wait → SIGKILL (spec §6.1)
-_KILL_GRACE_S = 2.0
-_POLL_S = 0.05
+from ..workload import KILL_GRACE_S, RECOVERY, RESCAN_S, TERM_GRACE_S, stop_workload
 
 
 class ProcessRunner:
     name = "process"
 
-    def __init__(self, term_grace_s: float = _TERM_GRACE_S, kill_grace_s: float = _KILL_GRACE_S):
-        # Grace periods are injectable so tests don't wait real seconds.
+    def __init__(
+        self,
+        term_grace_s: float = TERM_GRACE_S,
+        kill_grace_s: float = KILL_GRACE_S,
+        *,
+        rescan_s: float = RESCAN_S,
+        table: ProcessTable | None = None,
+    ):
+        # Grace periods are injectable so tests don't wait real seconds; the
+        # table so the decision logic can run against a fake process table.
         self.term_grace_s = term_grace_s
         self.kill_grace_s = kill_grace_s
+        self.rescan_s = rescan_s
+        self.table = table
 
     # --- start ------------------------------------------------------------
 
     def start(self, entry: RegistryProfile, port: int, log_path: Path) -> ProcessHandle:
         """Spawn ``entry.cmd`` with its own session, port injected, logs → file.
 
-        Returns a :class:`ProcessHandle` whose ``pid_start_time`` is captured
-        immediately so later kills can prove identity.
+        Returns a :class:`ProcessHandle` whose start time is captured
+        immediately so later signals can prove identity.
         """
         log_path.parent.mkdir(parents=True, exist_ok=True)
         env = {**os.environ, entry.port_env: str(port)}
-        # Own session/group (start_new_session=True) → the shell is the group
-        # leader and killpg(pgid) reaches every child it spawned.
+        # Own session (start_new_session=True) → the shell is the session and
+        # group leader, so sid == pgid == its pid, and everything it spawns is
+        # born into that session.
         with open(log_path, "ab", buffering=0) as log_f:
             proc = subprocess.Popen(
                 entry.cmd,
@@ -57,55 +70,53 @@ class ProcessRunner:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-        start_time = procutil.observe_start_time(proc.pid)
         # None only if it died between spawn and observe; a 0.0 sentinel then
-        # reads as "not our process" everywhere, so it is never mis-killed.
-        return ProcessHandle(pid=proc.pid, pid_start_time=start_time or 0.0)
+        # reads as "owner unverifiable" everywhere, so it is never signalled.
+        start_time = procutil.observe_start_time(proc.pid) or 0.0
+        return ProcessHandle(
+            pid=proc.pid,
+            pid_start_time=start_time,
+            sid=proc.pid,
+            sid_owner_start_time=start_time,
+            sid_owner=SID_OWNER_WORKLOAD,
+        )
 
     # --- stop -------------------------------------------------------------
 
-    def stop(self, handle: ProcessHandle) -> None:
-        """Verify-then-kill the whole process group. Idempotent (spec §6.1)."""
-        if not procutil.is_alive(handle):
-            return  # already dead or PID recycled — never kill what we don't own
-        # Shared with the readiness probe, which compares this against the pgid
-        # of whatever is listening on the port to tell our server from a squatter.
-        pgid = procutil.process_group_of(handle.pid)
-        if pgid is None:
-            return
-        self._signal_group(pgid, signal.SIGTERM)
-        if self._wait_gone(handle, self.term_grace_s):
-            return
-        # Survivors: re-verify identity, then escalate.
-        if procutil.is_alive(handle):
-            self._signal_group(pgid, signal.SIGKILL)
-            self._wait_gone(handle, self.kill_grace_s)
+    def stop(self, handle: ProcessHandle) -> StopOutcome:
+        """Stop every verified member of the handle's session. Idempotent.
+
+        Recovery mode: this process is not the session's owner, so each member
+        gets its own verified signal and no group is signalled (ADR-0016 §3).
+        An already-empty session is ``verified`` with nothing sent; an owner
+        that cannot be verified is ``incomplete`` with nothing sent.
+        """
+        return stop_workload(
+            handle.identity(),
+            RECOVERY,
+            term_grace_s=self.term_grace_s,
+            kill_grace_s=self.kill_grace_s,
+            rescan_s=self.rescan_s,
+            table=self.table,
+        )
 
     # --- alive / orphans --------------------------------------------------
 
     def alive(self, handle: ProcessHandle) -> bool:
-        return procutil.is_alive(handle)
+        """Does the workload session still have members?
+
+        Not "does the leader live": npm exiting while vite keeps the port is a
+        running server. ``AMBIGUOUS`` reads as alive on purpose — "cannot tell"
+        is not "nobody there" (ADR-0008) — so the lease is kept and surfaced
+        rather than deleted over something that may be ours.
+        """
+        ident = handle.identity()
+        scan = procutil.session_scan(
+            ident.sid, ident.owner_start, ident.exclude, table=self.table
+        )
+        return scan.state is not Membership.EMPTY
 
     def orphans(self) -> list[ProcessHandle]:
         # The process runner has no reliable machine-wide marker; sweep relies
         # on leases + the port block instead (spec §6.1). Compose will do better.
         return []
-
-    # --- internals --------------------------------------------------------
-
-    @staticmethod
-    def _signal_group(pgid: int, sig: int) -> None:
-        try:
-            os.killpg(pgid, sig)
-        except (ProcessLookupError, PermissionError):  # pragma: no cover - race/perm
-            pass
-
-    def _wait_gone(self, handle: ProcessHandle, timeout: float) -> bool:
-        """Poll until the handle's process is gone or ``timeout`` elapses."""
-        waited = 0.0
-        while waited < timeout:
-            if not procutil.is_alive(handle):
-                return True
-            time.sleep(_POLL_S)
-            waited += _POLL_S
-        return not procutil.is_alive(handle)

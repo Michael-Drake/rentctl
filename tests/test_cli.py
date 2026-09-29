@@ -24,6 +24,7 @@ class RecordingEvents:
 class RecordingService:
     def __init__(self, ok: bool = True, events: list[dict] | None = None):
         self.calls: list[tuple] = []
+        self.waits: list[float | None] = []
         self._ok = ok
         self.events = RecordingEvents(events)
 
@@ -31,8 +32,9 @@ class RecordingService:
         self.calls.append(("up", project, lease_minutes, profile, cwd))
         return {"ok": self._ok, "project": project, "port": 5180}
 
-    def env_down(self, project=None, cwd=None, reason=None, all_instances=False):
+    def env_down(self, project=None, cwd=None, reason=None, all_instances=False, wait_s=None):
         self.calls.append(("down", project, cwd, reason, all_instances))
+        self.waits.append(wait_s)
         return {"ok": True, "was_running": False}
 
     def env_ls(self):
@@ -100,6 +102,34 @@ def test_down_passes_declared_reason(capsys):
     rec = RecordingService()
     cli.main(["down", "--all", "--cwd", "/proj", "--reason", "session-end"], service=rec)
     assert rec.calls == [("down", None, "/proj", "session-end", False)]
+
+
+def test_down_wait_defaults_to_the_services_budget(capsys):
+    """No --wait means "let the service choose": 15 s, or 0 for a declared
+    session-end (ADR-0016 R0). The CLI does not second-guess it."""
+    rec = RecordingService()
+    cli.main(["down", "webapp"], service=rec)
+    cli.main(["down", "--all", "--reason", "session-end"], service=rec)
+    assert rec.waits == [None, None]
+
+
+def test_down_passes_wait_seconds(capsys):
+    """R7: `--wait SECONDS` is public; `--wait 0` is fire and forget."""
+    rec = RecordingService()
+    cli.main(["down", "webapp", "--wait", "0"], service=rec)
+    cli.main(["down", "--all", "--cwd", "/p", "--wait", "2.5"], service=rec)
+    assert rec.waits == [0.0, 2.5]
+
+
+def test_a_pending_down_exits_zero(capsys):
+    """`pending` is ok: the request was accepted and cleanup completes regardless."""
+
+    class Pending(RecordingService):
+        def env_down(self, *a, **kw):
+            return {"ok": True, "stopped": None, "pending": True, "state": "stopping"}
+
+    assert cli.main(["down", "webapp", "--wait", "0"], service=Pending()) == 0
+    assert json.loads(capsys.readouterr().out)["pending"] is True
 
 
 def test_down_rejects_forged_layer_reason(capsys):
