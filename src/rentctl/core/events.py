@@ -79,6 +79,60 @@ FALSE_KILL = "false_kill"
 # killing anything" is a claim the log should be able to show being exercised.
 WATCHDOG_SIGNAL_SKIPPED = "watchdog_signal_skipped"
 
+# --- the supervisor vocabulary (ADR-0016 §13) --------------------------------
+# Written by the supervisor, the service and the reconcilers
+# (``core/supervision.py``). Existing kinds and reasons keep their meaning, so
+# the pilot summary and the layer mapping still score correctly; ``summarize``
+# counts the new kinds apart from teardowns.
+
+# The requester wrote a stop (§8). Evidence that a hook fired inside its budget;
+# NOT a teardown, and never counted as one.
+STOP_REQUESTED = "stop_requested"
+# Entering ``cleanup_incomplete``, or becoming ``identity_ambiguous``. Replaces
+# the 1.0.x ``down{stop_failed: true}`` row, which ``summarize`` counted as a
+# teardown although nothing had been torn down.
+CLEANUP_INCOMPLETE = "cleanup_incomplete"
+# A reconciler found a registered supervisor dead.
+SUPERVISOR_LOST = "supervisor_lost"
+
+# New teardown reasons. None of them maps to a cleanup layer, deliberately:
+# they are not in LAYER_BY_REASON, so the pilot's ``layers`` block ignores them.
+LEASE_LOST = "lease-lost"                        # a supervisor found its lease gone or replaced
+STARTUP_ABANDONED = "startup-abandoned"          # the waiting ``up`` gave up on readiness
+SUPERVISOR_TERMINATED = "supervisor-terminated"  # an external SIGTERM reached the supervisor
+
+# ``up_failed.phase``
+PHASE_REGISTRATION = "registration"
+PHASE_SPAWN = "spawn"
+PHASE_READINESS = "readiness"
+PHASE_STATE_WRITE = "state_write"
+PHASE_UNSUPERVISABLE = "unsupervisable"
+PHASE_FOREIGN_LISTENER = "foreign_listener"
+PHASE_SUPERVISOR_LOST = "supervisor_lost"
+UP_FAILED_PHASES = (
+    PHASE_REGISTRATION,
+    PHASE_SPAWN,
+    PHASE_READINESS,
+    PHASE_STATE_WRITE,
+    PHASE_UNSUPERVISABLE,
+    PHASE_FOREIGN_LISTENER,
+    PHASE_SUPERVISOR_LOST,
+)
+
+# ``down.actor`` — who verified the teardown.
+ACTOR_SUPERVISOR = "supervisor"
+ACTOR_CLI = "cli"
+ACTOR_SWEEP = "sweep"
+ACTOR_LS = "ls"
+ACTOR_UP = "up"
+
+# ``down.cleanup`` / ``up_failed.cleanup``
+CLEANUP_VERIFIED = "verified"
+CLEANUP_INCOMPLETE_VALUE = "incomplete"
+
+# ``down.mode`` for a CLI recovering a lease whose supervisor is dead (§7).
+MODE_RECOVERY = "recovery"
+
 # --- teardown reasons, and the cleanup layer each one evidences (spec §8) ---
 
 EXPLICIT = "explicit"            # layer 1 — the LLM/human called down on a named project
@@ -165,6 +219,7 @@ class EventLog:
         lease_expires: str,
         already_running: bool,
         spawn_cwd: str | None = None,
+        **extra: Any,
     ) -> bool:
         """``cwd`` is the caller's directory; ``spawn_cwd`` is where the process
         actually ran, recorded only when it differs (ADR-0010 re-rooting). The
@@ -183,12 +238,15 @@ class EventLog:
             spawn_cwd=spawn_cwd,
             lease_expires=lease_expires,
             already_running=already_running,
+            **extra,
         )
 
     def record_up_failed(
-        self, project: str, *, profile: str, error: str, port: int | None = None
+        self, project: str, *, profile: str, error: str, port: int | None = None, **extra: Any
     ) -> bool:
-        return self.record(UP_FAILED, project, op=UP, profile=profile, error=error, port=port)
+        """``extra`` carries the §13 additions (``generation``, ``phase``,
+        ``cleanup``) that the supervisor knows and a 1.0.x-shaped caller does not."""
+        return self.record(UP_FAILED, project, op=UP, profile=profile, error=error, port=port, **extra)
 
     def record_false_kill(
         self,
@@ -225,18 +283,28 @@ class EventLog:
         killed: bool,
         port: int | None = None,
         pid: int | None = None,
-        stop_failed: bool | None = None,
+        cleanup: str | None = None,
+        escalated: bool | None = None,
+        **extra: Any,
     ) -> bool:
         """Record a teardown. ``layer`` is derived from ``reason`` — never passed in,
         so the reason table above stays the single source of the mapping.
 
-        ``stop_failed`` marks the case that used to be invisible: rentctl signalled
-        the process and it is **still alive**. Recorded only when true (``None``
-        is dropped by :meth:`record`), so its presence in the log always means
-        something went wrong rather than being a field to skim past. Without it,
-        a teardown that failed and a teardown that worked wrote identical rows —
-        and `killed` was the *intent*, not the outcome.
+        A ``down`` is written only for a teardown that finished: the lease is
+        gone. A stop that left survivors is :meth:`record_cleanup_incomplete`
+        instead. It used to be this same row with ``stop_failed: true``, and a
+        teardown that failed then counted as one that happened.
+
+        ``cleanup`` is ``"verified"`` when a stop scanned the workload's session
+        empty afterwards, and ``escalated`` says whether that took SIGKILL
+        (ADR-0016 §13). Both are omitted when no stop ran (the process was
+        already gone).
+
+        ``extra`` carries the rest of the §13 row: ``generation``, ``actor``,
+        ``attempts``, ``escaped_listener`` and the like. It never carries
+        ``layer``, which stays derived from ``reason`` alone.
         """
+        extra.pop("layer", None)
         return self.record(
             DOWN,
             project,
@@ -245,9 +313,47 @@ class EventLog:
             layer=LAYER_BY_REASON.get(reason),
             reason_source=reason_source,
             killed=killed,
-            stop_failed=stop_failed,
             port=port,
             pid=pid,
+            cleanup=cleanup,
+            escalated=escalated,
+            **extra,
+        )
+
+    def record_cleanup_incomplete(
+        self,
+        project: str,
+        *,
+        op: str,
+        reason: str,
+        reason_source: str,
+        survivors: list[dict[str, Any]],
+        identity_ambiguous: bool,
+        escalated: bool,
+        port: int | None = None,
+        pid: int | None = None,
+        detail: str | None = None,
+        **extra: Any,
+    ) -> bool:
+        """Record a stop that could not be verified; the lease was kept.
+
+        Carries no ``layer``: nothing was cleaned up, so no cleanup layer may be
+        credited with it. ``identity_ambiguous`` is the refusal case — nothing
+        was signalled because the session could not be proved ours.
+        """
+        return self.record(
+            CLEANUP_INCOMPLETE,
+            project,
+            op=op,
+            reason=reason,
+            reason_source=reason_source,
+            survivors=survivors,
+            identity_ambiguous=identity_ambiguous,
+            escalated=escalated,
+            port=port,
+            pid=pid,
+            detail=detail or None,
+            **extra,
         )
 
     def _append(self, line: bytes) -> bool:
@@ -367,18 +473,48 @@ def summarize(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     cleanup layer N ever been observed firing, on evidence rather than memory?"
     ``declared`` counts only teardowns whose caller stated its reason — the
     inferred ones are reported alongside, never merged in.
+
+    **What counts as a teardown (ADR-0016 §13).** Only a ``down``, and only once
+    per environment generation:
+
+    * ``stop_requested`` is a request, not a teardown. A ``down`` that answered
+      ``pending`` wrote one of these, and the supervisor writes the ``down`` when
+      it verifies the stop — the pair is one teardown, counted from the ``down``.
+    * ``cleanup_incomplete`` is a stop that did *not* finish; nothing was torn
+      down, so no layer is credited. Neither is a pre-release
+      ``down{stop_failed: true}`` row, which recorded the same thing.
+    * A ``down`` carrying a ``generation`` already seen is the same teardown
+      reported twice, and is not counted again. Generations are never reused,
+      so this cannot merge two real teardowns; 1.0.x rows carry none and are
+      counted exactly as before.
+    * The layer is the one :data:`LAYER_BY_REASON` gives the row's ``reason`` at
+      write time. The supervisor-only reasons (``lease-lost`` and friends) map
+      to no layer and are left out of ``layers``.
+
+    The ``supervision`` block counts the three §13 kinds on their own, so a
+    reader can see a hook firing (``stop_requested``), cleanup failing
+    (``cleanup_incomplete``) and helpers dying (``supervisor_lost``) without
+    any of them moving the gate's teardown numbers.
     """
     events = list(events)
     counts: dict[str, int] = {}
     layers: dict[str, dict[str, Any]] = {}
     kills = 0
     lease_cleanups = 0
+    seen_generations: set[str] = set()
+    duplicate_downs = 0
 
     for e in events:
         kind = str(e.get("event", "unknown"))
         counts[kind] = counts.get(kind, 0) + 1
-        if kind != DOWN:
+        if kind != DOWN or e.get("stop_failed"):
             continue
+        generation = e.get("generation")
+        if isinstance(generation, str) and generation:
+            if generation in seen_generations:
+                duplicate_downs += 1
+                continue
+            seen_generations.add(generation)
         if e.get("killed"):
             kills += 1
         else:
@@ -411,6 +547,12 @@ def summarize(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "layers": layers,
         "kills": kills,
         "lease_cleanups": lease_cleanups,
+        "supervision": {
+            "stop_requested": counts.get(STOP_REQUESTED, 0),
+            "cleanup_incomplete": counts.get(CLEANUP_INCOMPLETE, 0),
+            "supervisor_lost": counts.get(SUPERVISOR_LOST, 0),
+            "duplicate_downs": duplicate_downs,
+        },
         "sessions": _session_summary(events),
         "false_kills": _false_kill_summary(reports, kills),
     }

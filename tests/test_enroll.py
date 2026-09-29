@@ -16,7 +16,6 @@ from rentctl.core.errors import (
     NO_FREE_BLOCK,
     DevctlError,
 )
-from rentctl.core.models import Readiness
 from rentctl.core.registry import Registry
 
 TOML = """
@@ -35,10 +34,10 @@ NO = lambda plan: False    # noqa: E731
 
 
 @pytest.fixture
-def fake_runner():
-    from conftest import FakeRunner
+def world(devctl_home, clock):
+    from fakesup import FakeSupervision
 
-    return FakeRunner()
+    return FakeSupervision(devctl_home, clock)
 
 
 @pytest.fixture
@@ -488,7 +487,7 @@ def test_pin_check_survives_a_repo_that_moved_away(repo, devctl_home):
 
 # --- the pin on the runtime path (ADR-0003 §4) ----------------------------
 
-def test_env_up_refuses_a_changed_command(repo, devctl_home, fake_runner, clock):
+def test_env_up_refuses_a_changed_command(repo, devctl_home, world, clock):
     """The pin is worthless if nothing on the runtime path consults it. This is
     the test that fails if `check_pin` is ever dropped from `env_up`."""
     from rentctl.core.service import Service
@@ -500,18 +499,16 @@ def test_env_up_refuses_a_changed_command(repo, devctl_home, fake_runner, clock)
     svc = Service(
         devctl_home,
         now_fn=clock,
-        runner_factory=lambda name: fake_runner,
-        readiness_fn=lambda port, timeout, pgid: Readiness.ANSWERED,
-        watchdog_spawn=lambda project: 1,
+        supervision=world,
         session_id_fn=lambda: "sess-1",
     )
     result = svc.env_up("sampleapp")
     assert result["ok"] is False
     assert result["error"] == CMD_CHANGED
-    assert fake_runner.started == []          # nothing was executed
+    assert world.sups == {} and world.started == []  # nothing was spawned or executed
 
 
-def test_env_up_proceeds_when_the_pin_matches(repo, devctl_home, fake_runner, clock):
+def test_env_up_proceeds_when_the_pin_matches(repo, devctl_home, world, clock):
     from rentctl.core.service import Service
 
     root = repo(cmd="npm run dev")
@@ -519,14 +516,12 @@ def test_env_up_proceeds_when_the_pin_matches(repo, devctl_home, fake_runner, cl
     svc = Service(
         devctl_home,
         now_fn=clock,
-        runner_factory=lambda name: fake_runner,
-        readiness_fn=lambda port, timeout, pgid: Readiness.ANSWERED,
-        watchdog_spawn=lambda project: 1,
+        supervision=world,
         session_id_fn=lambda: "sess-1",
     )
     result = svc.env_up("sampleapp")
     assert result["ok"] is True
-    assert fake_runner.started != []
+    assert world.started != []
 
 
 # --- CLI surface ----------------------------------------------------------

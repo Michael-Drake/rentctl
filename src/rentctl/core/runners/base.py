@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from ..errors import REGISTRY_INVALID, DevctlError
+from ..models import CLEANUP_INCOMPLETE, CLEANUP_VERIFIED, StopOutcome
 from ..registry import RegistryProfile
 
 
@@ -34,8 +35,13 @@ class Runner(Protocol):
         """Spawn the environment on ``port``, logging to ``log_path``; return a handle."""
         ...
 
-    def stop(self, handle: Any) -> None:
-        """Idempotent teardown. A dead/recycled handle is a no-op, never an error."""
+    def stop(self, handle: Any) -> StopOutcome | None:
+        """Idempotent teardown. A dead/recycled handle is a no-op, never an error.
+
+        Returns what it achieved (ADR-0016 §4). ``None`` is what a runner
+        written against the 1.0 interface returns; :func:`stop_outcome` turns
+        that into an answer by asking ``alive`` afterwards.
+        """
         ...
 
     def alive(self, handle: Any) -> bool:
@@ -45,6 +51,27 @@ class Runner(Protocol):
     def orphans(self) -> list[Any]:
         """Broker-marked, lease-less handles this runner can find machine-wide."""
         ...
+
+
+def stop_outcome(runner: Runner, handle: Any) -> StopOutcome:
+    """Stop ``handle`` and return what the stop actually achieved.
+
+    Every teardown path goes through here so none of them can read "``stop()``
+    returned" as "the workload is gone" — the exact inference that deleted
+    leases over live servers in 1.0.x (S1). A runner that reports a
+    :class:`StopOutcome` is taken at its word; one that returns ``None`` is
+    asked ``alive()`` afterwards, and a live answer is ``incomplete``.
+    """
+    result = runner.stop(handle)
+    if isinstance(result, StopOutcome):
+        return result
+    if runner.alive(handle):
+        return StopOutcome(
+            cleanup=CLEANUP_INCOMPLETE,
+            signalled=True,
+            detail="signalled, but the runner still reports it alive",
+        )
+    return StopOutcome(cleanup=CLEANUP_VERIFIED, signalled=True)
 
 
 def get_runner(name: str) -> Runner:

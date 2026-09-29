@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -18,14 +20,81 @@ import pytest
 # child through the environment too — otherwise a bare checkout (the merge gate's
 # throwaway worktree, ADR-0058 D4) imports devctl here but not in the subprocess.
 _SRC = str(Path(__file__).resolve().parent.parent / "src")
+# tests/ too, so a spawned script can `from loopserve import LoopbackHTTPServer`
+# instead of restating the one test server (see tests/loopserve.py for why).
+_TESTS = str(Path(__file__).resolve().parent)
 os.environ["PYTHONPATH"] = os.pathsep.join(
-    [_SRC, *(p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p)]
+    [_SRC, _TESTS, *(p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p)]
 )
 
-from rentctl.core.models import ProcessHandle  # noqa: E402
+from rentctl.core import procutil, supervision  # noqa: E402
+from rentctl.core.models import SID_OWNER_WORKLOAD, ProcessHandle, WorkloadIdentity  # noqa: E402
 from rentctl.core.paths import DevctlPaths  # noqa: E402
+from rentctl.core.runners import process as process_runner_mod  # noqa: E402
 
 CDT = timezone(timedelta(hours=-5))
+
+# How long a session may take to finish emptying after the test body returns.
+# A stop that returned `verified` leaves nothing; this only covers a test whose
+# own cleanup SIGKILLed a group a moment ago and the kernel is still reaping.
+_LEFTOVER_SETTLE_S = 2.0
+
+
+@pytest.fixture(autouse=True)
+def workload_sessions():
+    """Record every workload session a test creates; fail the test if any is left.
+
+    ADR-0016's test-plan preamble: a survivor at teardown is a bug and must not
+    be tidied up quietly. Every ``ProcessRunner.start`` and every in-process
+    ``supervision.spawn_supervisor`` is recorded here, and a test that spawns a
+    session some other way (a CLI subprocess, say) appends its
+    :class:`WorkloadIdentity` to the returned list. At teardown each session is
+    scanned; verified members still alive are SIGKILLed one pid at a time — the
+    same verified signal the product uses, so this guard cannot hit a process
+    the test did not start — and then the test FAILS naming them.
+
+    An ``AMBIGUOUS`` session is never signalled (its owner cannot be proved),
+    and it does not fail the test: that verdict is the product refusing
+    correctly, which several tests set up on purpose.
+    """
+    created: list[WorkloadIdentity] = []
+    real_start = process_runner_mod.ProcessRunner.start
+    real_spawn = supervision.spawn_supervisor
+
+    def tracking_start(self, entry, port, log_path):
+        handle = real_start(self, entry, port, log_path)
+        created.append(handle.identity())
+        return handle
+
+    def tracking_spawn(*args, **kwargs):
+        # A supervisor IS its session (ADR-0016 §1). Recorded as a workload-owned
+        # identity, so the supervisor itself counts as a member: a supervisor or
+        # a workload process left running fails the test.
+        ref = real_spawn(*args, **kwargs)
+        created.append(WorkloadIdentity(ref.pid, ref.start_time, SID_OWNER_WORKLOAD))
+        return ref
+
+    process_runner_mod.ProcessRunner.start = tracking_start
+    supervision.spawn_supervisor = tracking_spawn
+    try:
+        yield created
+    finally:
+        process_runner_mod.ProcessRunner.start = real_start
+        supervision.spawn_supervisor = real_spawn
+    leftovers = []
+    for ident in created:
+        deadline = time.monotonic() + _LEFTOVER_SETTLE_S
+        scan = procutil.session_scan(ident.sid, ident.owner_start, ident.exclude)
+        while scan.state is procutil.Membership.MEMBERS and time.monotonic() < deadline:
+            time.sleep(0.05)
+            scan = procutil.session_scan(ident.sid, ident.owner_start, ident.exclude)
+        if scan.state is not procutil.Membership.MEMBERS:
+            continue
+        for m in scan.members:
+            procutil.verified_signal(m.pid, m.start_time, ident.sid, signal.SIGKILL)
+            leftovers.append(f"pid {m.pid} ({m.name}) in session {ident.sid}")
+    if leftovers:
+        pytest.fail("workload processes outlived the test (SIGKILLed now): " + "; ".join(leftovers))
 
 
 class FakeRunner:
