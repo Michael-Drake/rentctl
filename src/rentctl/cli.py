@@ -77,6 +77,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="declare which cleanup layer this is (the SessionEnd hook passes session-end)",
     )
+    # ADR-0016 §8, R0, R7. The supervisor finishes a stop whether or not anyone
+    # waits, so waiting is only about what the answer can say. Past the budget
+    # the answer is `pending`, which is ok: the request was accepted.
+    down.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="how long to wait for verified cleanup before answering `pending` "
+             "(default 15; 0 with --reason session-end; 0 = send the request and return)",
+    )
 
     sub.add_parser("ls", help="list every broker-owned environment on the machine")
     sub.add_parser("sweep", help="reconcile: stop expired/dead, report squatters")
@@ -187,9 +198,10 @@ def main(argv: list[str] | None = None, service: Service | None = None) -> int:
                 cwd=args.cwd,
                 reason=args.reason,
                 all_instances=args.all_instances,
+                wait_s=args.wait,
             )
         else:
-            result = svc.env_down(cwd=args.cwd, reason=args.reason)
+            result = svc.env_down(cwd=args.cwd, reason=args.reason, wait_s=args.wait)
     elif args.cmd == "ls":
         result = svc.env_ls()
     elif args.cmd == "events":

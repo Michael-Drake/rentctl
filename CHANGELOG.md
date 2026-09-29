@@ -6,9 +6,125 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: semver. Patch and minor are derived from the impact of what shipped;
 a major is **declared** by a human rather than computed.
 
-## [Unreleased]
+## [1.1.0] — release-ready, not yet published
 
-Nothing staged beyond 1.0.2.
+**rentctl now tracks the workload, not the launch process.** Every environment gets its
+own supervisor: a small rentctl process that starts the approved command inside a POSIX
+session it owns, and stays until that whole session is verified empty. It replaces the
+per-lease watchdog. One mechanism fixes the five findings below, which shared a root
+cause: rentctl kept track of the process it launched, and a dev server is rarely only
+that process.
+
+### Fixed
+
+- **S1 — Teardown could leave part of the server running.** A stop signalled the launch
+  process's group and treated "the leader died" as "the server is gone", so a child that
+  ignored `SIGTERM`, or outlived the shell that started it, survived teardown. Every stop
+  — explicit, session end, expiry, sweep, failed start — now runs one algorithm over the
+  whole session: `SIGTERM`, `SIGTERM` to anything forked during shutdown, per-process
+  `SIGKILL` after the 10 s grace, and a final scan. Only an empty scan counts as
+  stopped. Leases written by 1.0.x are stopped the same way.
+- **S2 — A server could exist for a moment with no lease naming it.** `rent up` now
+  writes the lease (`state: starting`, a fresh generation) before anything is spawned,
+  and the supervisor registers itself in it before launching the command. A CLI killed
+  mid-start no longer abandons a server: the supervisor carries on and the environment
+  is owned, leased and expiring as usual.
+- **S3 — Helpers were signalled by PID alone.** Every per-process signal re-checks the
+  target's PID and start time immediately before sending (through a pidfd on Linux),
+  and rentctl never sends `SIGTERM` to a supervisor. The wake signal (`SIGWINCH`) goes
+  only to a supervisor whose identity was verified, and a 1.0.x watchdog is signalled
+  only when its recorded start time proves it is still that watchdog.
+- **S4 — Strict squatter reclaim could hit a starting server.** A starting server now has
+  a lease before its first process, so its listener is never a squatter, and a listener
+  in a live lease's session is that lease's wherever it bound. Strict reclaim re-checks
+  under the project lock, re-verifies the listener's start time, and sends one `SIGTERM`
+  without escalating. **Strict remains off by default.**
+- **S5 — Session end could run out of time.** The `SessionEnd` hook ran every stop in
+  turn inside its budget, which Claude Code sets at about 1.5 s for a plugin's hook. It
+  now records a stop for every lease, wakes the supervisors and returns (`pending`); the
+  supervisors finish cleanup after the session has gone. A lease with no living
+  supervisor is handed to a detached recovery process instead of being stopped halfway.
+- **Expiry lands on time.** The supervisor checks its lease at least once a second, so a
+  lease is stopped within about a second of expiring, not up to a minute later.
+- **A failed stop no longer counts as a teardown** in `rent events --summary`. It is its
+  own event, `cleanup_incomplete`, and the lease is kept.
+- **A workload that had already exited could be reported as started.** If the command
+  died during startup while an unrelated process answered its port, and the port-owner
+  probe could not run, the start was accepted. A workload known to have exited now
+  always fails the start.
+- **Denied process inspection read as "no processes".** In an environment that refuses
+  to list processes (an agent's command sandbox, for example), a scan could come back
+  short or empty, and an empty scan means "the server is gone": cleanup was reported
+  complete and the lease removed while processes were still running. A refused scan is
+  now *unknown*. `rent up` refuses to start anything there (`UNSUPPORTED_ENVIRONMENT`).
+  If inspection is lost after a start, the lease is kept, nothing is signalled, and the
+  stop is recorded as `cleanup_incomplete` with `identity_ambiguous`, retried until the
+  session can be read again. See the README, "Where rentctl has to run".
+- **A server that started listening while readiness was being checked** was reported
+  "not on loopback — http://localhost will not reach it". Readiness now asks again once
+  the listener is known to be ours. (Also present, cosmetically, in 1.0.2.)
+
+### Added
+
+- **`rent down --wait SECONDS`** and MCP `env_down(wait_s=…)`: how long to wait for
+  verified cleanup (default 15 s; MCP at most 60 s; `0` returns at once; the session-end
+  hook uses `0`). Past the wait the answer is `"pending": true`, which is `"ok": true`.
+- **Three `down` answers, each exactly what the lease says:** `"stopped": true`;
+  `"stopped": false` with `"state": "cleanup_incomplete"` and `"survivors"` (the lease is
+  kept and the supervisor keeps retrying); or `"stopped": null, "pending": true`.
+- **New fields.** `rent up`: `state`, `supervisor_pid`. `rent ls`: `state` (`starting`,
+  `running`, `stopping`, `unsupervised`, `cleanup_incomplete`), `supervisor` (`pid`,
+  `registered`, `alive`), and when they apply `pending`, `stop_reason`, `survivors`,
+  `identity_ambiguous` and `legacy`.
+- **New error codes:** `STATE_WRITE_FAILED`, `SUPERVISOR_START_FAILED`,
+  `STOP_IN_PROGRESS` (`up` on an environment still stopping after 15 s),
+  `CLEANUP_INCOMPLETE` (`up` on an environment whose survivors are still named),
+  `UNSUPERVISABLE` (the command daemonized; its server left the supervised session and
+  is not signalled), and `UNSUPPORTED_ENVIRONMENT` (processes cannot be inspected here,
+  so nothing is started).
+- **New events:** `stop_requested` (a stop was asked for — evidence the hook fired, not
+  a teardown), `cleanup_incomplete` (a stop left survivors), and `supervisor_lost` (a
+  supervisor was found dead). `down` gains `generation`, `actor`, `cleanup: "verified"`,
+  `escalated`, `attempts`, `supervisor_lost` and `escaped_listener`. `rent events
+  --summary` counts the new kinds in a `supervision` block and counts each teardown once;
+  layer counts for 1.0.x logs are unchanged.
+- **Linux: whole-tree capture.** Each supervisor makes itself a child subreaper
+  (`prctl(PR_SET_CHILD_SUBREAPER)`, unprivileged), so every descendant of the command is
+  captured, including a double-forked `setsid()` daemon, and single-process signals go
+  through a pidfd. Both are feature-detected; a host that refuses them gets the macOS
+  guarantee.
+- **`rent doctor` reports the supervision level**: `supervision: session` (macOS, or
+  Linux without the subreaper) or `supervision: session+subreaper`, with the boundary
+  of each.
+
+### Changed
+
+- **A dead supervisor's server keeps serving.** The next `rent ls`, `sweep`, `up` or
+  `down` marks it `unsupervised` and records `supervisor_lost`; it is stopped at its
+  expiry or by `rent down`, not killed early. Recovery is not instant: it happens on
+  the next of those commands.
+- **On macOS, a command that daemonizes is reported, not supervised.** A process that
+  calls `setsid()` leaves the session; rentctl never signals it. If a command
+  daemonizes during startup, `rent up` fails with `UNSUPERVISABLE` rather than
+  reporting a start it cannot own.
+- **`up` on an environment mid-transition** waits for a `starting` one and returns it,
+  waits up to 15 s for a `stopping` one before starting fresh, and refuses one in
+  `cleanup_incomplete`.
+
+### Deprecated
+
+- **`rent-watchdog` / `devctl-watchdog`.** Nothing starts a watchdog any more. The
+  commands remain for watchdogs left running by 1.0.x: they babysit a 1.0.x lease with
+  the fixed stop, exit at once (`exit-lease-supervised`) on a 1.1 lease, and print a
+  one-line deprecation notice to stderr. They are removed in 2.0.
+
+### Upgrading
+
+- **Drain before upgrading:** run `rent down --all` in each project, then restart agent
+  sessions so their MCP servers load 1.1. Not draining is safe but degraded: 1.0.x
+  leases keep working (renewed in their old format, stopped by session membership), but
+  a 1.0.x watchdog still running enforces expiry with the old stop. Processes left
+  running from 1.0.x refuse 1.1 lease files rather than acting on them.
 
 ## [1.0.2] — release-ready, not yet published
 

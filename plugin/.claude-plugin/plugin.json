@@ -1,6 +1,6 @@
 {
   "name": "rentctl",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Leased dev environments for AI coding sessions — every server dies when its session ends, so none are left running rogue.",
   "author": {
     "name": "Michael Drake"

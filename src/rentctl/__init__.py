@@ -7,8 +7,9 @@ An MCP server + CLI that leases dev environments so a dev server can never
 outlive the work that needed it. Every environment is leased: it dies at
 session end, at lease expiry, or on request — whichever comes first.
 
-This package is three thin shells (``mcp_server``, ``cli``, ``watchdog``)
-over one core (``rentctl.core``). See ``README.md`` for the user-facing
+This package is thin shells (``mcp_server``, ``cli``, the per-lease
+``supervisor``, and the deprecated 1.0.x ``watchdog``) over one core
+(``rentctl.core``). See ``README.md`` for the user-facing
 contract, including the security model.
 """
 
@@ -16,4 +17,4 @@ contract, including the security model.
 # this literal at build time, so the package metadata is derived from this line rather
 # than restated alongside it. `core/wiring.py` imports it to stamp the plugin,
 # marketplace and registry manifests. Bumping it here is the whole of a version bump.
-__version__ = "1.0.2"
+__version__ = "1.1.0"

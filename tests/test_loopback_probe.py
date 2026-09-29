@@ -16,7 +16,8 @@ import socket
 from datetime import datetime
 
 import pytest
-from conftest import CDT, Clock, FakeRunner
+from conftest import CDT, Clock
+from fakesup import FakeSupervision
 
 from rentctl.core import procutil
 from rentctl.core import service as service_mod
@@ -82,7 +83,11 @@ def test_probe_is_false_when_nothing_listens():
 def test_env_up_and_ls_treat_an_ipv6_only_server_as_answering(
     devctl_home, write_registry, sample_registry_data, monkeypatch
 ):
-    """End to end through env_up/env_ls, with the REAL probe doing the dialling.
+    """Through env_up/env_ls, with the REAL probe doing the dialling.
+
+    Readiness is probed by the supervisor since ADR-0016, with this module's
+    ``_port_answering``; the fake supervisor reports what that call returns.
+    `healthy` on the board is dialled by the service itself, for real.
 
     The registry hands out webapp's block (5180), which is a real project's
     port on the developer's Mac — so the lease port is never bound here.
@@ -94,13 +99,18 @@ def test_env_up_and_ls_treat_an_ipv6_only_server_as_answering(
         real_port = srv.getsockname()[1]
         write_registry(sample_registry_data)
         monkeypatch.setattr(procutil, "port_owner", lambda port: None)
-        runner = FakeRunner()
+        clock = Clock(datetime(2026, 7, 14, 8, 0, tzinfo=CDT))
+        # The supervisor probes readiness with this same `_port_answering`
+        # (supervisor.py imports it), so the fake supervisor's "answered" stands
+        # for exactly the call proven on ::1 above.
+        world = FakeSupervision(
+            devctl_home, clock,
+            readiness="answered" if service_mod._port_answering(real_port) else "listening",
+        )
         svc = Service(
             devctl_home,
-            now_fn=Clock(datetime(2026, 7, 14, 8, 0, tzinfo=CDT)),
-            runner_factory=lambda name: runner,
-            readiness_timeout=0.25,
-            watchdog_spawn=lambda key: None,
+            now_fn=clock,
+            supervision=world,
             session_id_fn=lambda: "sess-1",
             port_answering_fn=lambda port: service_mod._port_answering(real_port),
         )

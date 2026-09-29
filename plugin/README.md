@@ -4,8 +4,10 @@ Installs both halves of rentctl into Claude Code:
 
 - the **MCP server**, so an agent has `env_up` / `env_down` / `env_ls` / `env_sweep`; and
 - the **session hooks**, so cleanup happens whether or not the agent cooperates —
-  `rent sweep` at session start, `rent down --all --cwd "$CLAUDE_PROJECT_DIR"` at
-  session end.
+  `rent sweep` at session start, `rent down --all --cwd "$CLAUDE_PROJECT_DIR" --reason
+  session-end` at session end. The session-end hook asks each environment's supervisor
+  to stop and returns at once, inside Claude Code's short hook budget; the supervisors
+  finish the cleanup after the session has gone.
 
 ## Quickstart
 

@@ -11,7 +11,7 @@ no changes above the interface.
 
 from __future__ import annotations
 
-from .base import Runner, get_runner
+from .base import Runner, get_runner, stop_outcome
 from .process import ProcessRunner
 
-__all__ = ["Runner", "ProcessRunner", "get_runner"]
+__all__ = ["Runner", "ProcessRunner", "get_runner", "stop_outcome"]

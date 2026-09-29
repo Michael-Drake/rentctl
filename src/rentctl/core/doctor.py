@@ -332,9 +332,12 @@ def check_project_hooks(
     **Double-wired is a WARN, not a FAIL and not an OK.** Claude Code
     deduplicates an identical handler across settings files but keeps "a
     plugin's … copy of the same handler separate", so both fire, in parallel.
-    That is safe: ``env_down`` takes the per-project lock and ``_down_lease``
-    re-reads the lease file *under* it, so whichever run loses the race finds no
-    lease, stops nothing and records nothing. It is still worth fixing — two
+    That is safe: ``env_down`` writes its stop request in ``_request_stop``,
+    which re-reads the lease file *under* the per-project lock, and the first
+    request wins (ADR-0016 §8). Whichever run loses the race finds the stop
+    already requested, or the lease already gone, and writes nothing and
+    records nothing; the one ``down`` comes from the actor that verified the
+    stop. It is still worth fixing — two
     copies of one wiring, upgraded by two different mechanisms, is the drift
     class this module's history is made of — but nothing is broken now, and
     paging on it is how a detector gets muted.
@@ -461,6 +464,97 @@ def check_project_hooks(
     )
 
 
+# --- supervision level (ADR-0016 §5, plan step 9) --------------------------
+
+#: Run in a throwaway child so the probe never changes the doctor process: the
+#: child-subreaper attribute is per process and dies with the child.
+SUPERVISION_PROBE = (
+    "import json; from rentctl.core import procutil; "
+    "print(json.dumps({'subreaper': procutil.enable_child_subreaper(), "
+    "'pidfd': procutil.pidfd_available()}))"
+)
+
+SESSION_BOUNDARY = (
+    "every process that stays in the environment's session is found and stopped "
+    "(orphans of an exited shell, SIGTERM-ignorers, setpgid() escapers, children "
+    "forked during shutdown). Boundary: a command that calls setsid() or daemonizes "
+    "(double-fork + setsid) leaves the session and escapes supervision; if it holds "
+    "the lease's port rentctl reports it and never signals it"
+)
+
+SUBREAPER_BOUNDARY = (
+    "each supervisor is a child subreaper (prctl PR_SET_CHILD_SUBREAPER), so every "
+    "descendant of the command is captured whatever its session: a process that "
+    "double-forks and setsid()s is still reparented to the supervisor, not init, and "
+    "is stopped with the rest. Boundary: a process that is not the command's "
+    "descendant is not captured — work handed to another manager (systemd-run, a "
+    "container runtime, at/cron, an already-running server such as tmux) — nor is an "
+    "orphan whose parent had moved it into a foreign PID namespace with setns(2), "
+    "since it reparents to that namespace's init; the capture also ends if the "
+    "supervisor itself is killed"
+)
+
+
+def check_supervision(
+    *, platform: str | None = None, runner: Runner | None = None
+) -> Check:
+    """Which supervision guarantee does this host give, and where does it end?
+
+    The level is what a supervisor started here would establish:
+    ``session`` (macOS, or Linux where the subreaper is refused) or
+    ``session+subreaper`` (Linux). On Linux the capability is **executed**, not
+    inferred from the kernel version: a child interpreter calls the same
+    ``enable_child_subreaper`` the supervisor calls and opens a pidfd. Each
+    lease also records the level its own supervisor actually got
+    (``supervisor.supervision``).
+
+    macOS at ``session`` is the designed guarantee, so OK. Linux that fell back
+    to ``session`` is a WARN: it works, with the weaker boundary. A probe that
+    could not run is UNKNOWN, never OK.
+    """
+    platform = platform or sys.platform
+    name = "supervision"
+    if not platform.startswith("linux"):
+        return Check(
+            name,
+            OK,
+            f"supervision: session ({platform}) — {SESSION_BOUNDARY}. Signals to single "
+            f"processes are identity-checked just before sending (no pidfd on this platform)",
+            probe="sys.platform",
+        )
+    probe = "python -c <procutil.enable_child_subreaper(); procutil.pidfd_available()>"
+    code, out, err = (runner or _subprocess_runner)([sys.executable, "-c", SUPERVISION_PROBE])
+    try:
+        found = json.loads(out) if code == 0 else None
+    except ValueError:
+        found = None
+    if not isinstance(found, dict):
+        tail = (err or out).strip().splitlines()
+        return Check(
+            name,
+            UNKNOWN,
+            "could not determine the supervision level: the probe failed "
+            f"({tail[-1] if tail else f'exit {code}'}); supervisors still give at least "
+            "`session`",
+            probe=probe,
+        )
+    pidfd = (
+        "signals to single processes go through a pidfd (race-free)"
+        if found.get("pidfd")
+        else "pidfds are unavailable here, so signals use the identity-checked kill() path"
+    )
+    if found.get("subreaper"):
+        return Check(name, OK, f"supervision: session+subreaper — {SUBREAPER_BOUNDARY}. {pidfd}",
+                     probe=probe)
+    return Check(
+        name,
+        WARN,
+        "supervision: session — prctl(PR_SET_CHILD_SUBREAPER) was refused on this Linux "
+        f"host, so it has the macOS guarantee: {SESSION_BOUNDARY}. {pidfd}",
+        probe=probe,
+    )
+
+
 # --- the whole examination ------------------------------------------------
 
 
@@ -481,6 +575,7 @@ def diagnose(
 
     report.checks.append(check_shim(COMMAND, runner=runner))
     report.checks.append(check_install_is_durable())
+    report.checks.append(check_supervision())
 
     registry_check = check_registry(paths)
     report.checks.append(registry_check)
