@@ -329,7 +329,7 @@ from rentctl.core.service import SESSION_ID_ENVS as SESSION_VARS
 # naming them — otherwise a real one leaking in from the environment the tests
 # run in (Claude Code sets CLAUDE_CODE_SESSION_ID) silently changes what a
 # "nothing is set" test is actually asserting.
-STRAY_VARS = ("CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "GEMINI_SESSION_ID")
+STRAY_VARS = ("CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "GEMINI_SESSION_ID", "CODEX_THREAD_ID")
 
 
 @pytest.fixture
@@ -399,6 +399,17 @@ def test_gemini_clis_documented_session_variable_is_read(clean_env):
     assert "GEMINI_SESSION_ID" in SESSION_VARS
     clean_env.setenv("GEMINI_SESSION_ID", "gem-session-1")
     assert Service._caller_session() == "gem-session-1"
+
+
+def test_codexs_shell_session_variable_is_read_last(clean_env):
+    """codex-cli 0.153.4, verified live 2026-09-29: CODEX_THREAD_ID is set in
+    the agent shell's env and equals the hook stdin session_id and MCP
+    `_meta.threadId` (ADR-0018 §4). Last, so an explicit override still wins."""
+    assert SESSION_VARS[-1] == "CODEX_THREAD_ID"
+    clean_env.setenv("CODEX_THREAD_ID", "codex-thread-1")
+    assert Service._caller_session() == "codex-thread-1"
+    clean_env.setenv("DEVCTL_SESSION_ID", "override")
+    assert Service._caller_session() == "override"
 
 
 def test_no_session_variable_is_carried_that_nothing_sets(clean_env):

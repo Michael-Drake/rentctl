@@ -137,7 +137,14 @@ class SupervisorRef:
 @dataclass(frozen=True)
 class StopRequest:
     """An on-disk stop request (§8). Honoured only while ``generation`` matches
-    the lease's; the first one written is the teardown's reason."""
+    the lease's; the first one written is the teardown's reason.
+
+    ``released_by`` and ``overrode_claims`` are ADR-0017 §9's attribution: the
+    session whose release of the last claim caused this stop, or the other
+    sessions' live claims a deliberate stop overrode. They ride on the request
+    so the ``down`` event, written later by whoever verifies the stop, can say
+    them. Both are left out of the file when unset.
+    """
 
     generation: str
     reason: str
@@ -145,9 +152,11 @@ class StopRequest:
     op: str
     requested_at: datetime
     requested_by: ProcessRef
+    released_by: str | None = None
+    overrode_claims: tuple[str, ...] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "generation": self.generation,
             "reason": self.reason,
             "reason_source": self.reason_source,
@@ -155,9 +164,16 @@ class StopRequest:
             "requested_at": self.requested_at.isoformat(),
             "requested_by": self.requested_by.to_dict(),
         }
+        if self.released_by is not None:
+            out["released_by"] = self.released_by
+        if self.overrode_claims is not None:
+            out["overrode_claims"] = list(self.overrode_claims)
+        return out
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "StopRequest":
+        released = d.get("released_by")
+        overrode = d.get("overrode_claims")
         return cls(
             generation=str(d["generation"]),
             reason=str(d["reason"]),
@@ -165,7 +181,47 @@ class StopRequest:
             op=str(d["op"]),
             requested_at=datetime.fromisoformat(d["requested_at"]),
             requested_by=ProcessRef.from_dict(d["requested_by"]),
+            released_by=None if released is None else str(released),
+            overrode_claims=None if overrode is None else tuple(str(x) for x in overrode),
         )
+
+
+# The claim key for a caller rentctl could not identify (ADR-0017 §5): one
+# shared, anonymous bucket. The same string as ``events.UNATTRIBUTED``.
+UNKNOWN_SESSION = "unknown"
+
+
+@dataclass(frozen=True)
+class Claim:
+    """One session's entitlement to a lease's environment (ADR-0017 §1).
+
+    ``since`` and ``via`` are ``None`` only on the claim read from a
+    pre-upgrade lease, which recorded neither.
+    """
+
+    expires: datetime
+    since: datetime | None = None
+    via: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"since": _iso(self.since), "expires": self.expires.isoformat(), "via": self.via}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Claim":
+        via = d.get("via")
+        return cls(
+            expires=datetime.fromisoformat(d["expires"]),
+            since=_dt(d.get("since")),
+            via=None if via is None else str(via),
+        )
+
+
+def _claims_from(raw: Any) -> "dict[str, Claim] | None":
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"claims is not an object: {raw!r}")
+    return {str(k): Claim.from_dict(v) for k, v in raw.items()}
 
 
 # ``Survivor`` is ``models.Survivor`` (re-exported above): the row a stop
@@ -297,6 +353,14 @@ class Lease:
     # ``startup_failed`` only: ``{code, message, log_tail, phase}`` for the waiting ``up``.
     error: dict[str, Any] | None = None
 
+    # --- claims (ADR-0017 §1) ------------------------------------------------
+    # session id → Claim. ``None`` is a lease written before claims existed; it
+    # reads as one claim ``{session: {expires}}`` (§5) through
+    # :meth:`claim_map`. Once set, ``expires`` above is derived from it on every
+    # claim write: the latest unexpired claim's expiry. Everything that reads
+    # ``expires`` (the supervisor, reconcile, a 1.0.x watchdog) is unchanged.
+    claims: dict[str, Claim] | None = None
+
     @property
     def is_legacy(self) -> bool:
         return self.schema == SCHEMA_LEGACY
@@ -330,7 +394,13 @@ class Lease:
             "recovery": None if self.recovery is None else self.recovery.to_dict(),
             "error": self.error,
             "watchdog_pid": POISON_WATCHDOG_PID,
+            **self._claims_dict(),
         }
+
+    def _claims_dict(self) -> dict[str, Any]:
+        if self.claims is None:
+            return {}
+        return {"claims": {k: c.to_dict() for k, c in self.claims.items()}}
 
     def _legacy_dict(self) -> dict[str, Any]:
         # Exactly the 1.0.x key set: a legacy lease renewed by 1.1 must still
@@ -349,6 +419,9 @@ class Lease:
             "expires": self.expires.isoformat(),
             "log": self.log,
             "spawn_cwd": self.spawn_cwd,
+            # Absent until a claim is written (ADR-0017). A 1.0.x reader ignores
+            # unknown keys, and ``expires`` above is still the one it acts on.
+            **self._claims_dict(),
         }
 
     @classmethod
@@ -390,6 +463,7 @@ class Lease:
                 cleanup=_opt(CleanupRecord.from_dict, d.get("cleanup")),
                 recovery=_opt(RecoveryClaim.from_dict, d.get("recovery")),
                 error=d.get("error"),
+                claims=_claims_from(d.get("claims")),
             )
         except (KeyError, ValueError, TypeError, AttributeError) as e:
             raise DevctlError(LEASE_INVALID, f"malformed lease: {e}") from e
@@ -415,8 +489,9 @@ class Lease:
                     if d.get("watchdog_pid_start_time") is None
                     else float(d["watchdog_pid_start_time"])
                 ),
+                claims=_claims_from(d.get("claims")),
             )
-        except (KeyError, ValueError, TypeError) as e:
+        except (KeyError, ValueError, TypeError, AttributeError) as e:
             raise DevctlError(LEASE_INVALID, f"malformed lease: {e}") from e
 
     # --- disk I/O ---------------------------------------------------------
@@ -494,6 +569,47 @@ class Lease:
                 owner=SID_OWNER_WORKLOAD,
             )
         return None  # a legacy lease with no handle pid names nothing — never guess one
+
+    # --- claims (ADR-0017) -------------------------------------------------
+
+    def claim_map(self) -> dict[str, Claim]:
+        """Every recorded claim, lapsed or not. A pre-upgrade lease (no
+        ``claims`` field) reads as one claim held by its ``session`` (§5)."""
+        if self.claims is not None:
+            return dict(self.claims)
+        return {self.session or UNKNOWN_SESSION: Claim(expires=self.expires)}
+
+    def live_claims(self, now: datetime) -> dict[str, Claim]:
+        """The claims that have not lapsed at ``now``."""
+        return {k: c for k, c in self.claim_map().items() if now < c.expires}
+
+    def with_claims(self, claims: dict[str, Claim], now: datetime) -> "Lease":
+        """A copy holding ``claims`` pruned of lapsed ones, with ``expires``
+        derived: the latest live claim's expiry. With none live the lease is
+        expired now, which is what "nobody is entitled to it" means (§1)."""
+        live = {k: c for k, c in claims.items() if now < c.expires}
+        expires = max((c.expires for c in live.values()), default=min(self.expires, now))
+        return replace(self, claims=live, expires=expires)
+
+    def claimed(
+        self, session: str, *, expires: datetime, now: datetime, via: str | None = None
+    ) -> "Lease":
+        """Add or renew ``session``'s claim, and only that one (§3)."""
+        claims = self.claim_map()
+        prev = claims.get(session)
+        live_prev = prev is not None and now < prev.expires
+        claims[session] = Claim(
+            expires=expires,
+            since=prev.since if live_prev and prev.since is not None else now,
+            via=via if via is not None else (prev.via if prev is not None else None),
+        )
+        return self.with_claims(claims, now)
+
+    def released(self, session: str, now: datetime) -> "Lease":
+        """Drop ``session``'s claim, and only that one (§4)."""
+        claims = self.claim_map()
+        claims.pop(session, None)
+        return self.with_claims(claims, now)
 
     def is_expired(self, now: datetime) -> bool:
         return now >= self.expires

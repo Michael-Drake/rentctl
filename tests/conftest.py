@@ -183,6 +183,9 @@ def devctl_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> DevctlPaths:
     monkeypatch.delenv("DEVCTL_STATE_HOME", raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    # `rent doctor` reads Codex's config (ADR-0018 §8); never the developer's own.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home-unset"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-home-unset"))
     paths = DevctlPaths.default()
     paths.ensure_dirs()
     return paths

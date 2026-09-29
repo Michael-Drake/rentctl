@@ -252,6 +252,11 @@ def record_down(
 ) -> bool:
     """The one ``down`` per terminal teardown, written by whoever verified it."""
     cleanup = lease.cleanup
+    stop = lease.stop
+    # ADR-0017 §7, §9: which sessions this teardown concerned. The request
+    # carries who released the last claim or whose claims a deliberate stop
+    # overrode; an expiry lists the claims that lapsed.
+    lapsed = sorted(lease.claim_map()) if reason in (ev.EXPIRY, ev.SWEEP_EXPIRED) else None
     return log.record_down(
         lease.project,
         op=op,
@@ -269,6 +274,10 @@ def record_down(
         supervisor_lost=supervisor_lost or None,
         escaped_listener=escaped,
         supervisor_pid=None if lease.supervisor is None else lease.supervisor.pid,
+        released_by=None if stop is None else stop.released_by,
+        overrode_claims=None if stop is None or stop.overrode_claims is None
+        else list(stop.overrode_claims),
+        lapsed_claims=lapsed or None,
     )
 
 
@@ -340,6 +349,8 @@ def record_stop_requested(log: EventLog, lease: Lease, requester: ProcessRef) ->
         reason_source=stop.reason_source,
         requester_pid=requester.pid,
         port=lease.port,
+        released_by=stop.released_by,
+        overrode_claims=None if stop.overrode_claims is None else list(stop.overrode_claims),
     )
 
 

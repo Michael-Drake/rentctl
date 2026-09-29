@@ -34,7 +34,13 @@ from .core import wiring
 from .core.errors import DevctlError
 from .core.events import EXPLICIT, SESSION_END, parse_since, summarize
 from .core.paths import DevctlPaths
-from .core.service import DEFAULT_LEASE_MINUTES, Service, _now_local
+from .core.service import (
+    DEFAULT_LEASE_MINUTES,
+    Service,
+    _now_local,
+    caller_session,
+    read_hook_session,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -52,12 +58,19 @@ def _build_parser() -> argparse.ArgumentParser:
     sub =parser.add_subparsers(dest="cmd", required=True)
 
     up = sub.add_parser("up", help="start (or renew) a project's environment")
-    up.add_argument("project", help="registry project key")
+    up.add_argument(
+        "project", nargs="?", default=None,
+        help="registry project key (default: the one this checkout's rentctl.toml declares)",
+    )
     up.add_argument("--lease-minutes", type=int, default=DEFAULT_LEASE_MINUTES)
     up.add_argument("--profile", default="default")
     up.add_argument("--cwd", default=None, help="caller project dir recorded on the lease")
 
-    down = sub.add_parser("down", help="stop a project, or all leased to --cwd")
+    down = sub.add_parser(
+        "down",
+        help="stop a project, or all leased to --cwd (with --reason session-end: release "
+             "this session's claim; it stops only if no other session holds one)",
+    )
     down.add_argument("project", nargs="?", default=None)
     down.add_argument("--all", action="store_true", help="down everything leased to --cwd")
     down.add_argument("--cwd", default=None)
@@ -192,6 +205,11 @@ def main(argv: list[str] | None = None, service: Service | None = None) -> int:
     if args.cmd == "up":
         result = svc.env_up(args.project, args.lease_minutes, args.profile, cwd=args.cwd)
     elif args.cmd == "down":
+        # `--reason session-end` is the SessionEnd hook: a *release* of this
+        # session's claim, not a stop for everyone (ADR-0017 §4). The hook's
+        # contract channel for its session id is JSON on stdin, so it wins over
+        # env here; every other `down` is a person's deliberate stop.
+        session = read_hook_session() if args.reason == SESSION_END else None
         if args.project is not None and not args.all:
             result = svc.env_down(
                 project=args.project,
@@ -199,17 +217,18 @@ def main(argv: list[str] | None = None, service: Service | None = None) -> int:
                 reason=args.reason,
                 all_instances=args.all_instances,
                 wait_s=args.wait,
+                session=session,
             )
         else:
-            result = svc.env_down(cwd=args.cwd, reason=args.reason, wait_s=args.wait)
+            result = svc.env_down(cwd=args.cwd, reason=args.reason, wait_s=args.wait, session=session)
     elif args.cmd == "ls":
         result = svc.env_ls()
     elif args.cmd == "events":
         result = _events(svc, args)
     elif args.cmd == "report-kill":
         result = svc.report_false_kill(args.project, note=args.note, port=args.port)
-    else:  # sweep
-        result = svc.env_sweep()
+    else:  # sweep — the SessionStart hook; stdin identity first (ADR-0017 §2)
+        result = svc.env_sweep(session=caller_session(from_hook=True))
 
     # A human reads this. `rent sweep` on a bad registry was printing
     # "registry invalid — squatter detection skipped" to a terminal.

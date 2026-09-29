@@ -4,7 +4,7 @@
     "name": "Michael Drake",
     "url": "https://github.com/Michael-Drake"
   },
-  "description": "The rentctl plugin — the MCP server plus the session hooks that tear leased dev environments down when the session ends.",
+  "description": "The rentctl plugin for Claude Code and Codex — the MCP server plus the session hooks that tear leased dev environments down when the session ends.",
   "plugins": [
     {
       "name": "rentctl",

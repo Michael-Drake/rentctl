@@ -98,6 +98,39 @@ def _run_git(args: list[str], cwd: str) -> str | None:
     return proc.stdout.strip() or None
 
 
+# The lease-identity probe runs on the session-end path, inside a client's
+# 1.5 s hook budget, so it gets a far shorter leash than the re-rooting probe.
+_CHECKOUT_TIMEOUT_S = 1.0
+
+
+def _run_git_quick(args: list[str], cwd: str) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, *args], capture_output=True, text=True,
+            timeout=_CHECKOUT_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def checkout_root(path: str, git: GitFn | None = None) -> str:
+    """The checkout a directory belongs to — the key a lease is recorded under.
+
+    A session launched in ``repo/src`` and one launched in ``repo`` are working
+    in the same checkout and must share one environment (ADR-0017); keyed on
+    the raw launch directory they drew two ports and two servers for the same
+    tree. The git worktree top level is the checkout; separate worktrees keep
+    separate keys (ADR-0007). Outside git, or when git cannot answer in time,
+    the directory itself is the key, as before.
+    """
+    here = os.path.realpath(path)
+    top = _toplevel(git or _run_git_quick, here)
+    return top or here
+
+
 def _toplevel(git: GitFn, cwd: str) -> str | None:
     out = git(["rev-parse", "--show-toplevel"], cwd)
     return os.path.realpath(out) if out else None

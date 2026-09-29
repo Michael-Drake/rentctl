@@ -25,6 +25,7 @@ class RecordingService:
     def __init__(self, ok: bool = True, events: list[dict] | None = None):
         self.calls: list[tuple] = []
         self.waits: list[float | None] = []
+        self.sessions: list[str | None] = []
         self._ok = ok
         self.events = RecordingEvents(events)
 
@@ -32,16 +33,19 @@ class RecordingService:
         self.calls.append(("up", project, lease_minutes, profile, cwd))
         return {"ok": self._ok, "project": project, "port": 5180}
 
-    def env_down(self, project=None, cwd=None, reason=None, all_instances=False, wait_s=None):
+    def env_down(self, project=None, cwd=None, reason=None, all_instances=False, wait_s=None,
+                 *, release=None, session=None):
         self.calls.append(("down", project, cwd, reason, all_instances))
         self.waits.append(wait_s)
+        self.sessions.append(session)
         return {"ok": True, "was_running": False}
 
     def env_ls(self):
         self.calls.append(("ls",))
         return {"ok": True, "environments": []}
 
-    def env_sweep(self):
+    def env_sweep(self, session=None):
+        self.sessions.append(session)
         self.calls.append(("sweep",))
         return {"ok": True, "swept": [], "kept": []}
 

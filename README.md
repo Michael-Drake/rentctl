@@ -181,7 +181,8 @@ renews it rather than starting a second server.
 
 | Client | How it is wired | Session-end cleanup |
 |---|---|---|
-| Claude Code | the plugin, or `rent init` (`.mcp.json` + `.claude/settings.local.json`) | **Yes** — SessionEnd runs `rent down --all --cwd "$CLAUDE_PROJECT_DIR" --reason session-end`; SessionStart runs `rent sweep` |
+| Claude Code | the plugin ([guide](docs/claude-code.md)), or `rent init` (`.mcp.json` + `.claude/settings.local.json`) | **Yes** — SessionEnd releases the session's claim (`rent down --all --cwd … --reason session-end`); SessionStart runs `rent sweep` |
+| Codex | the plugin ([guide](docs/codex.md)) | **Yes, once you trust the plugin's hooks** (`/hooks`) — the same hooks; until then, expiry and sweep |
 | Gemini CLI | `rent init` (`.gemini/settings.json`), when Gemini is used in the project or installed | **Yes** — same hooks, scoped by `$GEMINI_PROJECT_DIR` |
 | Any other MCP client | register `rent-mcp` yourself | **No** — lease expiry and sweep only |
 | A plain shell | `rent` | **No** — lease expiry and sweep only |
@@ -189,7 +190,7 @@ renews it rather than starting a second server.
 "Expiry and sweep only" still guarantees the server dies — just at the end of its lease
 (120 minutes by default), not when you close the window.
 
-**Plugin-only installs need the CLI too.** The Claude Code plugin calls the `rent` and
+**Plugin-only installs need the CLI too.** The plugin (Claude Code or Codex) calls the `rent` and
 `rent-mcp` you installed with `uv tool install rentctl`; it does not bundle them, and it
 deliberately does not fetch its own copy — a second, different rentctl acting on the same
 leases is worse than none. Without `rent` on `PATH`, session-end cleanup is **off**: every
@@ -219,8 +220,8 @@ outlived the shell that launched it, is stopped with the rest.
 Four independent layers decide *when*, so no single failure leaves an orphan:
 
 1. **You ask** — `rent down`.
-2. **The session ends** — a `SessionEnd` hook asks for a stop of everything leased to
-   that directory.
+2. **The session ends** — a `SessionEnd` hook releases that session's claim on everything
+   leased to that directory. The server stops if no other session still holds a claim.
 3. **The lease expires** — the supervisor starts the stop within about a second of the
    lease running out, even if the session died without running its hook.
 4. **The next sweep** — `rent sweep` (which the hooks also run at session start) and
@@ -244,8 +245,8 @@ at once). The MCP tool `env_down` takes the same wait as `wait_s` — 15 s by de
 
 **Session end returns fast; cleanup finishes in the background.** Claude Code gives a
 plugin's `SessionEnd` hook about 1.5 s. So the hook's `rent down --all --reason
-session-end` doesn't wait: it records a stop for every lease, wakes each supervisor, and
-returns `pending`. The supervisors don't need the session to finish. A lease with no
+session-end` doesn't wait: it records a stop for every lease that no other session still
+holds, wakes each supervisor, and returns `pending`. The supervisors don't need the session to finish. A lease with no
 living supervisor is handed to a detached recovery process rather than stopped halfway.
 
 **A crashed session is cleaned up by layers 3 and 4, not 2.** If the session dies
@@ -293,16 +294,29 @@ restricted containers), Linux gets the macOS guarantee.
 `supervision: session+subreaper`. **Neither is a sandbox** — a command that sets out to
 escape supervision can.
 
-### One active session per checkout
+### Several sessions in one checkout share one server
 
-A lease belongs to a **(project, directory)** pair, not to a session. Two agent sessions
-open in the *same* checkout share one environment — the second `rent up` renews the
-first's server rather than starting its own — and the first session to end runs
-`rent down --all --cwd` and tears it down under the other.
+A lease belongs to a **(project, directory)** pair, so two agent sessions in the *same*
+checkout share one server and one port. Each session that runs `rent up` holds its own
+expiring **claim** on it, and the lease lasts as long as its latest claim. A session's
+`up` renews only its own claim. `rent ls` and the `up` result list the claims, and
+`shared_with` names the other sessions.
 
-Separate git worktrees avoid this entirely: each worktree is its own directory, gets its
-own lease and its own port, and its session end touches only its own server. Shared
-sessions in one checkout are a known limitation, with no fix promised yet.
+When a session ends, its SessionEnd hook **releases** that session's claim. The server
+stops only when no other session still holds one. A session that never leased the
+server changes nothing when it ends. The MCP tool `env_down` also releases by default:
+it answers `"stopped": false` with `held_by` while others hold the server, and
+`force: true` stops it for everyone. `rent down` typed by a person always stops, and
+lists any other sessions' claims it overrode in `overrode_claims`.
+
+This depends on knowing which session is asking. Claude Code hooks send the session id
+on stdin, and rentctl also reads `DEVCTL_SESSION_ID`, `CLAUDE_CODE_SESSION_ID` and
+`GEMINI_SESSION_ID`. `rent doctor` says which one it found. A caller with none of them is
+`unknown`, and every `unknown` caller shares one claim. A release can never remove
+another session's claim, so an unidentified session end leaves the server running until
+it expires. It never stops a server another session is using.
+
+Separate git worktrees still give each session its own server, port and lease.
 
 ### Where rentctl has to run: somewhere it can see processes
 
@@ -413,8 +427,13 @@ their session are *supposed* to. Keep it on development machines.
 
 ## Troubleshooting
 
+Agent-client problems (missing tools, hooks, approval, cleanup that did not happen):
+[docs/troubleshooting.md](docs/troubleshooting.md). Which clients and surfaces were
+tested, and how: [docs/integrations.md](docs/integrations.md).
+
 - **`rent doctor`** checks that the `rent` shim runs, the registry loads, and each
-  enrolled project's hooks are wired, and says which supervision level this host gets. If `rent` itself is missing, the same check runs
+  enrolled project's hooks are wired, and says which supervision level this host gets and
+  where it found this session's id (`session-identity`). If `rent` itself is missing, the same check runs
   as `python3 -m rentctl.doctor`.
 - **Server logs** are in `~/.local/state/devctl/logs/<project>-<timestamp>.log` (under
   `$XDG_STATE_HOME` if set). A failed `rent up` includes the log's tail in its output.
@@ -422,7 +441,8 @@ their session are *supposed* to. Keep it on development machines.
   that did it; the raw log is `~/.local/state/devctl/events.jsonl`. A teardown's `down`
   event says whether the stop was verified and whether it needed `SIGKILL`
   (`"escalated": true`). `stop_requested` means a stop was asked for (for example by the
-  session-end hook) and is not itself a teardown.
+  session-end hook) and is not itself a teardown. Neither is `claim_released`: a session
+  let go of a server that others still hold.
 - **`rent ls` shows each lease's `state`** and whether its supervisor is alive:
   - `stopping` or `"pending": true` — a stop is under way; look again in a few seconds.
   - `unsupervised` — its supervisor died. The server is still yours and still serving;
@@ -448,7 +468,9 @@ them would orphan every live lease.)
 Stated plainly, because a tool making safety claims should be honest about its edges:
 
 - **The approval pin covers the command, not the code** — see Security.
-- **One active session per checkout** — see above; use worktrees for parallel sessions.
+- **Sessions in one checkout share one server** — see above. A session that rentctl
+  cannot identify releases nothing when it ends, so its server lives until the lease
+  expires.
 - **Crash cleanup waits for expiry** — a session that dies without its hook leaves its
   server up until the lease runs out.
 - **Recovery waits for the next command** — if a supervisor is killed, nothing acts
@@ -456,8 +478,9 @@ Stated plainly, because a tool making safety claims should be honest about its e
 - **Daemonizing commands are not supervised on macOS**, and on Linux work handed to
   another process manager is not — see
   [What supervision covers](#what-supervision-covers-per-platform).
-- **Only Claude Code and Gemini CLI get session-end hooks.** Other clients get expiry and
-  sweep.
+- **Only Claude Code, Codex (with its hooks trusted) and Gemini CLI get session-end
+  hooks.** Other clients get expiry and sweep. Cloud agent sessions (claude.ai/code cloud,
+  Codex Cloud) are not supported: they cannot reach your machine's processes.
 - `runner = "compose"` is designed but not implemented. Asking for it fails with a clear
   error rather than doing nothing.
 - The only environment beyond the port is `port_env`. Anything else a server needs has to

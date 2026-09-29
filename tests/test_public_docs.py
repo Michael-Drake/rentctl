@@ -78,3 +78,16 @@ def test_security_policy_publishes_no_email_address():
     text = (REPO_ROOT / "SECURITY.md").read_text(encoding="utf-8")
     assert "security/advisories/new" in text
     assert not re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
+
+
+def test_every_generated_plugin_file_ships_byte_identical(published_tree: Path):
+    """Both clients install from the published repo, so every file wiring
+    renders must travel — the dot-dirs (`.claude-plugin/`, `.codex-plugin/`)
+    and `hooks/` included. A plugin missing `hooks/hooks.json` installs with
+    no cleanup in either client while listing as installed (the 1.0.0 shape)."""
+    from rentctl.core import wiring
+
+    for rel, render in wiring.GENERATED_FILES.items():
+        shipped = published_tree / rel
+        assert shipped.is_file(), f"{rel} is not in the published tree"
+        assert shipped.read_text(encoding="utf-8") == render(), rel

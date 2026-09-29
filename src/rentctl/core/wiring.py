@@ -175,6 +175,22 @@ def _when_cli_present(command: str, otherwise: str) -> str:
     return f"if command -v {COMMAND} >/dev/null 2>&1; then {command}; else {otherwise}; fi"
 
 
+# The plugin's SessionEnd teardown (ADR-0018 §2). Client-neutral: Claude Code
+# sets CLAUDE_PROJECT_DIR; Codex leaves it empty (verified, codex-cli 0.153.4) and
+# runs the hook in the session cwd, so the shell default falls back to that. A
+# bare "$CLAUDE_PROJECT_DIR" would run `rent down --all --cwd ""` under Codex.
+# Deliberately a spelling rentctl 1.1.0's CLI already accepts, so a plugin
+# upgraded ahead of the Python package still cleans up.
+PLUGIN_SESSION_END_COMMAND = (
+    f'{COMMAND} down --all --cwd "${{CLAUDE_PROJECT_DIR:-$(pwd -P)}}" --reason session-end'
+)
+
+# Codex clamps a SessionEnd hook's timeout to 3 s; Claude Code gives plugin
+# SessionEnd hooks a 1.5 s budget whatever this says. The command sends its stop
+# requests and returns in far less (R0), so 3 is the honest number for both.
+PLUGIN_SESSION_END_TIMEOUT = 3
+
+
 def plugin_hooks_fragment() -> dict[str, Any]:
     """The plugin's hooks: :func:`hooks_fragment`, each command guarded.
 
@@ -194,8 +210,13 @@ def plugin_hooks_fragment() -> dict[str, Any]:
       exit 2, whose stderr Claude Code shows to the user. It will often land as
       the terminal closes; on ``/clear`` and ``/resume`` it is seen.
 
-    The guarded branch runs the **unaltered** ``init`` command, so the two
-    delivery paths still execute the same teardown (ADR-0002 §5). The ``init``
+    The guarded branch runs the ``init`` teardown with one difference in how the
+    project directory is named (ADR-0018 §2): the plugin serves Claude Code *and*
+    Codex, and Codex leaves ``$CLAUDE_PROJECT_DIR`` empty, so the plugin spells
+    it ``"${CLAUDE_PROJECT_DIR:-$(pwd -P)}"`` — Claude Code's value where there
+    is one, else the hook's cwd, which Codex sets to the session cwd (the MCP
+    server's cwd, so the lease key matches). SessionEnd's ``timeout`` is
+    :data:`PLUGIN_SESSION_END_TIMEOUT`, Codex's clamp. The ``init``
     fragment itself is left bare on purpose: :func:`_group_is_ours` recognises a
     hook by its first token, and an ``if`` there would make every enrolled
     project's hook look foreign to the next ``init``.
@@ -212,12 +233,18 @@ def plugin_hooks_fragment() -> dict[str, Any]:
         },
         ensure_ascii=True,
     )
+    # The sweep's own JSON result is discarded (WI-0086): on SessionStart, stdout
+    # is hook output. Codex rejects it as "invalid session start JSON output" and
+    # shows "Hook failed" on every healthy session (1.2.0 live acceptance), and
+    # Claude Code hands it to the model as context nobody asked for. A failed
+    # sweep still exits non-zero with its reason on stderr.
     start["command"] = _when_cli_present(
-        start["command"], f"printf '%s\\n' {shlex.quote(start_output)}"
+        f"{start['command']} >/dev/null", f"printf '%s\\n' {shlex.quote(start_output)}"
     )
     end = hooks["SessionEnd"][0]["hooks"][0]
+    end["timeout"] = PLUGIN_SESSION_END_TIMEOUT
     end["command"] = _when_cli_present(
-        end["command"],
+        PLUGIN_SESSION_END_COMMAND,
         f"printf '%s\\n' {shlex.quote(MISSING_CLI_SESSION_END)} >&2; exit 2",
     )
     return hooks
@@ -230,6 +257,15 @@ def mcp_fragment() -> dict[str, Any]:
     Requires ``rent-mcp`` on PATH.
     """
     return {"command": f"{COMMAND}-mcp", "args": []}
+
+
+PLUGIN_DESCRIPTION = (
+    "Leased dev environments for AI coding sessions — every server dies "
+    "when its session ends, so none are left running rogue."
+)
+PLUGIN_AUTHOR = "Michael Drake"
+REPOSITORY_URL = "https://github.com/Michael-Drake/rentctl"
+PLUGIN_KEYWORDS = ("dev-server", "lease", "cleanup", "mcp", "ports")
 
 
 def plugin_manifest() -> dict[str, Any]:
@@ -246,22 +282,19 @@ def plugin_manifest() -> dict[str, Any]:
     writes from, so the plugin and the CLI cannot disagree. A hand-kept second
     copy is the exact drift this module's docstring forbids, and the checked-in
     artifact is guarded by a test that re-renders and compares. The hooks go
-    through :func:`plugin_hooks_fragment`, which wraps each ``init`` command —
-    unaltered — in a check that the CLI is installed (ADR-0015).
+    through :func:`plugin_hooks_fragment`, which wraps each ``init`` command in a
+    check that the CLI is installed (ADR-0015).
 
-    Both are inlined rather than pointed at sibling files. The schema allows
-    either; inlining keeps the whole plugin one generated artifact, so there is
-    no second file that can be regenerated out of step with the first.
+    **No ``hooks`` key (ADR-0018 §1).** The hooks live in ``hooks/hooks.json``
+    (:func:`plugin_hooks_file`), the one file both Claude Code and Codex load.
+    Claude Code *merges* inline manifest hooks with that file, so carrying both
+    would fire every hook twice; Codex ignores inline hooks entirely, which is
+    how 1.1.0 installed into Codex with no cleanup. The shapes also differ: the
+    file is wrapped (``{"hooks": {...}}``), the inline map was bare — and 1.0.0
+    shipped the wrapped shape inline, so Claude Code ignored every entry. A
+    manifest with no ``hooks`` key cannot repeat either mistake.
 
-    **``hooks`` takes the event map directly** — ``{"SessionEnd": [...]}``, not
-    ``{"hooks": {"SessionEnd": [...]}}``. The wrapped form is the *settings file*
-    shape (:func:`render_hooks_text`), and reusing it here shipped in 1.0.0 as a
-    real defect: `claude plugin validate` reports ``hooks.hooks: unknown hook
-    event; entry ignored at runtime``, so the published plugin installed **no
-    cleanup at all** — the exact half-a-product failure this manifest exists to
-    prevent, wearing the face of a working install. The two shapes differ by one
-    level of nesting and nothing else, which is why the fragment being correct
-    was not enough to make the manifest correct.
+    The MCP server stays inline, as the bare command ``rent-mcp`` (ADR-0018 §3).
 
     ``version`` tracks the package version. It was deliberately absent while
     rentctl had no released version (WI-0023); 1.0.0 settled that, and a plugin
@@ -272,20 +305,16 @@ def plugin_manifest() -> dict[str, Any]:
     return {
         "name": SERVER_NAME,
         "version": __version__,
-        "description": (
-            "Leased dev environments for AI coding sessions — every server dies "
-            "when its session ends, so none are left running rogue."
-        ),
-        "author": {"name": "Michael Drake"},
+        "description": PLUGIN_DESCRIPTION,
+        "author": {"name": PLUGIN_AUTHOR},
         # `Michael-Drake` IS the canonical casing — verified against the GitHub
         # API, which resolves the name case-insensitively but reports
         # `"login": "Michael-Drake"`. A pre-publish review asserted the opposite
         # and it was briefly "fixed" to lowercase before the probe was run.
         # Keep in step with `[project.urls]` in pyproject.toml.
-        "repository": "https://github.com/Michael-Drake/rentctl",
+        "repository": REPOSITORY_URL,
         "license": "Apache-2.0",
-        "keywords": ["dev-server", "lease", "cleanup", "mcp", "ports"],
-        "hooks": plugin_hooks_fragment(),
+        "keywords": list(PLUGIN_KEYWORDS),
         "mcpServers": {SERVER_NAME: mcp_fragment()},
     }
 
@@ -299,6 +328,80 @@ def render_plugin_manifest() -> str:
     the field a user reads to decide whether to install this.
     """
     return json.dumps(plugin_manifest(), indent=2, ensure_ascii=False) + "\n"
+
+
+def plugin_hooks_file() -> dict[str, Any]:
+    """The plugin's ``hooks/hooks.json``: :func:`plugin_hooks_fragment`, **wrapped**.
+
+    Both clients read this file from the plugin root with no manifest key, and
+    both require the ``{"hooks": {...}}`` envelope here (verified: Claude Code
+    rejects a bare map in this file; Codex reads plugin hooks only in this shape
+    from this file). The bare map is the *inline* shape, which this plugin no
+    longer uses (ADR-0018 §1).
+    """
+    return {"hooks": plugin_hooks_fragment()}
+
+
+def render_plugin_hooks_file() -> str:
+    """``hooks/hooks.json`` as bytes."""
+    return json.dumps(plugin_hooks_file(), indent=2, ensure_ascii=False) + "\n"
+
+
+# The Codex manifest's store-facing copy (ADR-0018). Codex's bundled validator
+# requires every `interface` field below; `defaultPrompt` is at most three
+# starter prompts of at most 128 characters each.
+CODEX_SHORT_DESCRIPTION = "Leased dev servers that die when the session ends"
+CODEX_LONG_DESCRIPTION = (
+    "rentctl starts your project's dev server on a leased port and stops it when "
+    "the Codex session ends, so no server is left running rogue. The plugin adds "
+    "the env_up / env_down / env_ls / env_sweep tools and the session hooks; it "
+    "runs the rentctl CLI installed on this machine (uv tool install rentctl)."
+)
+CODEX_DEFAULT_PROMPTS = (
+    "Run this app",
+    "Why won't my dev server start?",
+    "Stop the dev server for this project",
+)
+
+
+def codex_plugin_manifest() -> dict[str, Any]:
+    """The Codex plugin manifest for ``.codex-plugin/plugin.json`` (ADR-0018).
+
+    Codex prefers this file over ``.claude-plugin/plugin.json`` when both exist.
+    Shared fields come from :func:`plugin_manifest`, so the two manifests cannot
+    describe different plugins. **No ``hooks`` key**: Codex's validator rejects
+    it, and Codex discovers ``hooks/hooks.json`` without one. The MCP server is
+    the bare ``rent-mcp`` — ``${PLUGIN_ROOT}`` is not expanded by codex-cli
+    0.153.4 (ADR-0018 §3). ``version`` must be strict semver; the package
+    version is.
+    """
+    base = plugin_manifest()
+    return {
+        "name": base["name"],
+        "version": base["version"],
+        "description": base["description"],
+        "author": {"name": PLUGIN_AUTHOR, "url": "https://github.com/Michael-Drake"},
+        "homepage": REPOSITORY_URL,
+        "repository": REPOSITORY_URL,
+        "license": base["license"],
+        "keywords": base["keywords"],
+        "skills": "./skills/",
+        "mcpServers": base["mcpServers"],
+        "interface": {
+            "displayName": SERVER_NAME,
+            "shortDescription": CODEX_SHORT_DESCRIPTION,
+            "longDescription": CODEX_LONG_DESCRIPTION,
+            "developerName": PLUGIN_AUTHOR,
+            "category": "Coding",
+            "capabilities": ["Interactive"],
+            "defaultPrompt": list(CODEX_DEFAULT_PROMPTS),
+        },
+    }
+
+
+def render_codex_plugin_manifest() -> str:
+    """``.codex-plugin/plugin.json`` as bytes. ``ensure_ascii=False`` per :func:`render_plugin_manifest`."""
+    return json.dumps(codex_plugin_manifest(), indent=2, ensure_ascii=False) + "\n"
 
 
 # The marketplace entry point. `plugin.json` describes the plugin; this is what
@@ -327,8 +430,8 @@ def marketplace_manifest() -> dict[str, Any]:
         "name": MARKETPLACE_NAME,
         "owner": {"name": "Michael Drake", "url": "https://github.com/Michael-Drake"},
         "description": (
-            "The rentctl plugin — the MCP server plus the session hooks that tear "
-            "leased dev environments down when the session ends."
+            "The rentctl plugin for Claude Code and Codex — the MCP server plus the "
+            "session hooks that tear leased dev environments down when the session ends."
         ),
         "plugins": [
             {
@@ -343,6 +446,28 @@ def marketplace_manifest() -> dict[str, Any]:
 def render_marketplace_manifest() -> str:
     """The marketplace manifest as bytes. ``ensure_ascii=False`` per :func:`render_plugin_manifest`."""
     return json.dumps(marketplace_manifest(), indent=2, ensure_ascii=False) + "\n"
+
+
+# Every checked-in file rendered from this module, by repo-relative path. The
+# suite's drift test walks this map, and :func:`write_generated_files` is the one
+# regeneration step — so a new generated file cannot be added without its test.
+GENERATED_FILES = {
+    "plugin/.claude-plugin/plugin.json": render_plugin_manifest,
+    "plugin/.codex-plugin/plugin.json": render_codex_plugin_manifest,
+    "plugin/hooks/hooks.json": render_plugin_hooks_file,
+    ".claude-plugin/marketplace.json": render_marketplace_manifest,
+}
+
+
+def write_generated_files(repo_root: Path) -> list[Path]:
+    """Re-render every file in :data:`GENERATED_FILES` under ``repo_root``."""
+    written = []
+    for rel, render in GENERATED_FILES.items():
+        path = repo_root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(render())
+        written.append(path)
+    return written
 
 
 # --- the MCP registry entry (WI-0009) -------------------------------------
@@ -865,7 +990,15 @@ def plugin_installed(claude_home: Path | None = None, project_root: Path | None 
 
 
 def _claude_home(claude_home: Path | None) -> Path:
-    return Path(claude_home) if claude_home is not None else Path.home() / ".claude"
+    """Claude Code's config dir: explicit, else ``$CLAUDE_CONFIG_DIR``, else ``~/.claude``.
+
+    ``CLAUDE_CONFIG_DIR`` is Claude Code's own documented override ("All
+    settings, session history, and plugins are stored under this path").
+    """
+    if claude_home is not None:
+        return Path(claude_home)
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(env) if env else Path.home() / ".claude"
 
 
 def _covering_keys(entries: dict[str, Any], project_root: Path | None) -> list[str]:

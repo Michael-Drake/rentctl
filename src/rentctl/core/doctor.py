@@ -46,11 +46,13 @@ that skips on "command not found" reproduces the original outage exactly.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+import tomllib
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -58,7 +60,14 @@ from typing import Any
 from .paths import DevctlPaths
 from .registry import Registry
 from .runtimes import CLAUDE_CODE, RuntimeBinding
-from .wiring import COMMAND, INSTALL_COMMAND, OWNED_COMMANDS, PluginState, plugin_state
+from .wiring import (
+    COMMAND,
+    INSTALL_COMMAND,
+    OWNED_COMMANDS,
+    SERVER_NAME,
+    PluginState,
+    plugin_state,
+)
 
 # --- statuses -------------------------------------------------------------
 
@@ -555,7 +564,327 @@ def check_supervision(
     )
 
 
+# --- session identity (ADR-0017 §2) -----------------------------------------
+
+# A runtime's project-dir variable is how doctor can tell it is running inside an
+# agent session, where an unresolved session id is a degradation, not the norm.
+_AGENT_SESSION_MARKERS = ("CLAUDE_PROJECT_DIR", "GEMINI_PROJECT_DIR", "DEVCTL_PROJECT_DIR")
+
+
+def check_session_identity(environ: dict[str, str] | None = None) -> Check:
+    """Which source resolved this process's session id, so a silent fall to
+    ``unknown`` shows up (ADR-0017 Consequences).
+
+    Env only, as the MCP server and an agent's ``rent up`` resolve it; hook
+    stdin applies only to the hook commands. ``unknown`` in a plain terminal is
+    expected and OK. Inside an agent session (a runtime's project-dir variable
+    is set) it WARNs: that session's claims all share the anonymous bucket.
+    """
+    from .service import SESSION_ID_ENVS
+
+    env = os.environ if environ is None else environ
+    probe = "env: " + ", ".join(SESSION_ID_ENVS)
+    for name in SESSION_ID_ENVS:
+        if (env.get(name) or "").strip():
+            return Check("session-identity", OK, f"resolved from {name}", probe=probe, source=name)
+    in_agent = any(env.get(m) for m in _AGENT_SESSION_MARKERS)
+    if in_agent:
+        return Check(
+            "session-identity", WARN,
+            "unknown: an agent project-dir variable is set but no session variable is, so "
+            "this session's claims fall into the shared `unknown` bucket and its "
+            "SessionEnd cannot release them — they lapse at expiry instead",
+            probe=probe, source="unknown",
+        )
+    return Check(
+        "session-identity", OK,
+        "unknown: no session variable is set (expected outside an agent session)",
+        probe=probe, source="unknown",
+    )
+
+
+# --- Codex (ADR-0018 §8) ---------------------------------------------------
+
+# The three silent failure modes the Codex contract found, each of which leaves
+# rentctl looking installed while cleanup or the tools are off:
+#   1. the plugin is installed but not enabled;
+#   2. its hooks are not trusted — Codex runs no hook, plugin hooks included,
+#      until the user trusts it in `/hooks`, so SessionEnd cleanup never fires;
+#   3. a `[mcp_servers.rentctl]` in config.toml silently shadows the plugin's
+#      server of the same name.
+# All three are read from `$CODEX_HOME/config.toml` (default `~/.codex`), the
+# file `codex plugin add` and `/hooks` write. Verified on codex-cli 0.153.4.
+
+CODEX_CONFIG = "config.toml"
+# `[hooks.state."<plugin>@<marketplace>:hooks/hooks.json:<event>:<group>:<hook>"]`;
+# rentctl's hooks file has one group with one hook per event.
+CODEX_HOOK_EVENTS = ("session_start", "session_end")
+CODEX_HOOKS_FILE = "hooks/hooks.json"
+CODEX_INSTALL = (
+    "codex plugin marketplace add Michael-Drake/rentctl && "
+    f"codex plugin add {SERVER_NAME}@{SERVER_NAME}"
+)
+CODEX_UNTRUSTED = (
+    "not trusted: run /hooks in Codex and trust rentctl's hooks — until then "
+    "cleanup falls back to lease expiry"
+)
+
+
+def codex_home(environ: Mapping[str, str] | None = None) -> Path:
+    """Where Codex keeps its config: ``$CODEX_HOME``, else ``~/.codex``."""
+    env = os.environ if environ is None else environ
+    value = (env.get("CODEX_HOME") or "").strip()
+    return Path(value).expanduser() if value else Path.home() / ".codex"
+
+
+def codex_present(home: Path, *, which: Callable[[str], str | None] | None = None) -> bool:
+    """Whether Codex is on this machine at all: ``codex`` on PATH, or its home."""
+    which = which or shutil.which
+    return bool(which("codex")) or home.is_dir()
+
+
+def _codex_plugin_keys(plugins: Any) -> list[str]:
+    """``rentctl@<marketplace>`` keys under ``[plugins]`` — any marketplace."""
+    if not isinstance(plugins, dict):
+        return []
+    return sorted(k for k in plugins if isinstance(k, str) and k.split("@", 1)[0] == SERVER_NAME)
+
+
+def check_codex(home: Path) -> list[Check]:
+    """The Codex plugin's state, its hook trust, and MCP shadowing (ADR-0018 §8).
+
+    Reads ``config.toml`` only; never writes it. What this cannot do is
+    recompute Codex's ``trusted_hash``, so a present trust entry is reported as
+    exactly that — "trust entry present" — not as "the current hooks are
+    trusted": if the hook text changed since the user trusted it, Codex asks
+    again, and this check cannot see that.
+    """
+    config = home / CODEX_CONFIG
+    probe = f"read {config}"
+    if not config.exists():
+        return [Check(
+            "codex:plugin", OK,
+            f"Codex is present but has no {config}, so the rentctl plugin is not "
+            f"installed there (to use rentctl from Codex: {CODEX_INSTALL})",
+            probe=probe,
+        )]
+    try:
+        data = tomllib.loads(config.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        return [Check(
+            "codex:plugin", UNKNOWN,
+            f"couldn't tell: {config} will not read as TOML ({exc}), so the plugin's "
+            "state, its hook trust and MCP shadowing are all unknown",
+            probe=probe,
+        )]
+
+    checks: list[Check] = []
+    plugins = data.get("plugins")
+    keys = _codex_plugin_keys(plugins)
+    shadow = data.get("mcp_servers")
+    shadowed = isinstance(shadow, dict) and SERVER_NAME in shadow
+
+    if not keys:
+        checks.append(Check(
+            "codex:plugin", OK,
+            f"the rentctl plugin is not installed in Codex (to use rentctl from Codex: {CODEX_INSTALL})",
+            probe=probe,
+        ))
+        return checks
+
+    enabled = [k for k in keys if isinstance(plugins[k], dict) and plugins[k].get("enabled") is True]
+    unclear = [
+        k for k in keys
+        if not isinstance(plugins[k], dict) or not isinstance(plugins[k].get("enabled"), bool)
+    ]
+    if enabled:
+        checks.append(Check(
+            "codex:plugin", OK, f"{', '.join(enabled)} is installed and enabled in Codex",
+            probe=probe,
+        ))
+    elif unclear:
+        checks.append(Check(
+            "codex:plugin", UNKNOWN,
+            f"couldn't tell: [plugins.\"{unclear[0]}\"] in {config} has no boolean "
+            "`enabled`, so whether Codex loads it is unknown",
+            probe=probe,
+        ))
+    else:
+        checks.append(Check(
+            "codex:plugin", WARN,
+            f"{', '.join(keys)} is installed in Codex but disabled: its tools and "
+            f"cleanup hooks do not load (set enabled = true under [plugins.\"{keys[0]}\"] "
+            f"in {config})",
+            probe=probe,
+        ))
+
+    checks.append(_check_codex_hook_trust(enabled or keys, data, config, probe))
+
+    if shadowed:
+        checks.append(Check(
+            "codex:mcp-shadow", WARN,
+            f"[mcp_servers.{SERVER_NAME}] in {config} silently shadows the plugin's "
+            f"MCP server of the same name, so Codex runs that entry instead: delete "
+            f"the [mcp_servers.{SERVER_NAME}] table and let the plugin supply the server",
+            probe=probe,
+        ))
+    else:
+        checks.append(Check(
+            "codex:mcp-shadow", OK,
+            f"no [mcp_servers.{SERVER_NAME}] in {config} shadows the plugin's server",
+            probe=probe,
+        ))
+    return checks
+
+
+def _check_codex_hook_trust(keys: list[str], data: dict[str, Any], config: Path, probe: str) -> Check:
+    hooks = data.get("hooks", {})
+    state = hooks.get("state", {}) if isinstance(hooks, dict) else None
+    if not isinstance(state, dict):
+        return Check(
+            "codex:hooks", UNKNOWN,
+            f"couldn't tell: [hooks.state] in {config} is not a table, so hook trust is unknown",
+            probe=probe,
+        )
+    for key in keys:
+        entries = [f"{key}:{CODEX_HOOKS_FILE}:{event}:0:0" for event in CODEX_HOOK_EVENTS]
+        missing = [
+            e for e in entries
+            if not (isinstance(state.get(e), dict)
+                    and isinstance(state[e].get("trusted_hash"), str)
+                    and state[e]["trusted_hash"].strip())
+        ]
+        if not missing:
+            return Check(
+                "codex:hooks", OK,
+                f"trust entry present for {key}'s SessionStart and SessionEnd hooks "
+                "(the hash itself cannot be checked here; if the hook text changed, "
+                "Codex asks again in /hooks)",
+                probe=probe,
+            )
+    events = ", ".join(m.rsplit(":", 3)[1] for m in missing)
+    return Check(
+        "codex:hooks", WARN,
+        f"{keys[-1]}'s hooks are {CODEX_UNTRUSTED} (no trusted_hash for: {events})",
+        probe=probe,
+    )
+
+
 # --- the whole examination ------------------------------------------------
+
+
+# --- does the INSTALLED plugin wire the hooks this rentctl expects? ------------
+#
+# Found by the 1.2.0 live acceptance run (D2): a plugin whose SessionEnd command
+# was broken passed `claude plugin validate --strict`, and `rent doctor` said
+# `hooks: ok` because the plugin was enabled and `rent` resolved. Nothing read
+# the hook the client would actually run, so cleanup fell silently to expiry.
+# This reads the installed copy — the bytes the client loads — and compares it
+# with the render this rentctl ships. It cannot see a plugin a session loaded
+# with `--plugin-dir`; it speaks for installs.
+
+_HOOK_EVENTS = ("SessionStart", "SessionEnd")
+
+
+def _hook_commands_in(events: Any) -> dict[str, list[str]] | None:
+    if not isinstance(events, dict):
+        return None
+    out: dict[str, list[str]] = {}
+    for event in _HOOK_EVENTS:
+        cmds: list[str] = []
+        for group in events.get(event) or []:
+            for hook in (group.get("hooks") if isinstance(group, dict) else None) or []:
+                if isinstance(hook, dict) and isinstance(hook.get("command"), str):
+                    cmds.append(hook["command"])
+        out[event] = cmds
+    return out
+
+
+def installed_hook_commands(plugin_root: Path, *, inline_ok: bool) -> dict[str, list[str]] | None:
+    """The SessionStart/SessionEnd commands a client loads from an installed plugin.
+
+    ``hooks/hooks.json`` (the wrapped shape) is what both clients load.
+    ``inline_ok`` also accepts a manifest's bare inline map — Claude Code loads
+    that (rentctl 1.0.x/1.1.x shipped it); Codex silently ignores it. ``None``
+    when ``hooks/hooks.json`` exists but will not parse.
+    """
+    found: dict[str, list[str]] = {e: [] for e in _HOOK_EVENTS}
+    hooks_file = plugin_root / "hooks" / "hooks.json"
+    if hooks_file.is_file():
+        try:
+            data = json.loads(hooks_file.read_text())
+        except (OSError, ValueError):
+            return None
+        got = _hook_commands_in(data.get("hooks") if isinstance(data, dict) else None)
+        if got is None:
+            return None
+        for e in _HOOK_EVENTS:
+            found[e] += got[e]
+    manifest = plugin_root / ".claude-plugin" / "plugin.json"
+    if inline_ok and manifest.is_file():
+        try:
+            data = json.loads(manifest.read_text())
+        except (OSError, ValueError):
+            data = {}
+        got = _hook_commands_in(data.get("hooks") if isinstance(data, dict) else None)
+        if got is not None:
+            for e in _HOOK_EVENTS:
+                found[e] += got[e]
+    return found
+
+
+def check_installed_plugin_hooks(name: str, plugin_root: Path, *, inline_ok: bool) -> Check:
+    from .wiring import plugin_hooks_fragment
+
+    probe = f"read {plugin_root}/hooks/hooks.json" + (
+        " and .claude-plugin/plugin.json#hooks" if inline_ok else ""
+    ) + "; compared with this rentctl's render"
+    if not plugin_root.is_dir():
+        return Check(name, WARN, f"the install register names {plugin_root}, which does not exist — "
+                     "reinstall the plugin", probe)
+    got = installed_hook_commands(plugin_root, inline_ok=inline_ok)
+    if got is None:
+        return Check(name, UNKNOWN, f"couldn't tell: {plugin_root}/hooks/hooks.json will not "
+                     "parse as a hook file", probe)
+    want = _hook_commands_in(plugin_hooks_fragment()) or {}
+    if not got["SessionEnd"]:
+        return Check(name, FAIL, f"the installed plugin at {plugin_root} gives the client no "
+                     "SessionEnd hook it will load — session-end cleanup is OFF and "
+                     "environments stop only at lease expiry. Reinstall or update the plugin.",
+                     probe)
+    if got == want:
+        return Check(name, OK, f"the installed plugin at {plugin_root} wires SessionStart and "
+                     "SessionEnd exactly as this rentctl renders them", probe)
+    return Check(name, WARN, f"the installed plugin at {plugin_root} wires hooks that differ "
+                 "from this rentctl's (a plugin and package at different versions, or an "
+                 "edited install): session-end cleanup may not run as documented. Update the "
+                 "plugin to match `rent --version`.", probe)
+
+
+def claude_plugin_roots(claude_home: Path | None = None) -> list[Path]:
+    """Install paths of our plugin in Claude Code's register, any scope."""
+    from .wiring import _claude_home
+
+    home = _claude_home(claude_home)
+    try:
+        entries = json.loads((home / "plugins" / "installed_plugins.json").read_text())["plugins"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    roots: list[Path] = []
+    for key, installs in (entries.items() if isinstance(entries, dict) else []):
+        if not isinstance(key, str) or key.split("@", 1)[0] != SERVER_NAME:
+            continue
+        for install in installs if isinstance(installs, list) else []:
+            p = install.get("installPath") if isinstance(install, dict) else None
+            if isinstance(p, str) and Path(p) not in roots:
+                roots.append(Path(p))
+    return roots
+
+
+def codex_plugin_roots(home: Path) -> list[Path]:
+    """Cached install dirs of our plugin in Codex (``plugins/cache/<mkt>/rentctl/<ver>``)."""
+    base = home / "plugins" / "cache"
+    return sorted(p for p in base.glob(f"*/{SERVER_NAME}/*") if p.is_dir()) if base.is_dir() else []
 
 
 def diagnose(
@@ -564,11 +893,14 @@ def diagnose(
     runner: Runner | None = None,
     binding: RuntimeBinding = CLAUDE_CODE,
     claude_home: Path | None = None,
+    codex_home_dir: Path | None = None,
 ) -> Report:
     """Run every check and return the report. Never raises.
 
     ``claude_home`` is where Claude Code keeps its plugin register and user
-    settings (default ``~/.claude``); injectable so tests never read the real one.
+    settings (default ``~/.claude``); ``codex_home_dir`` is Codex's
+    (default ``$CODEX_HOME`` or ``~/.codex``). Both injectable so tests never
+    read the real ones. The Codex checks appear only when Codex is present.
     """
     paths = paths or DevctlPaths.default()
     report = Report()
@@ -576,6 +908,16 @@ def diagnose(
     report.checks.append(check_shim(COMMAND, runner=runner))
     report.checks.append(check_install_is_durable())
     report.checks.append(check_supervision())
+    report.checks.append(check_session_identity())
+
+    for root in claude_plugin_roots(claude_home):
+        report.checks.append(check_installed_plugin_hooks("plugin-hooks:claude-code", root, inline_ok=True))
+
+    home = codex_home_dir if codex_home_dir is not None else codex_home()
+    if codex_present(home):
+        report.checks.extend(check_codex(home))
+        for root in codex_plugin_roots(home):
+            report.checks.append(check_installed_plugin_hooks("plugin-hooks:codex", root, inline_ok=False))
 
     registry_check = check_registry(paths)
     report.checks.append(registry_check)

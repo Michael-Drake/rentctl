@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import configparser
 import json
+import os
 import re
 import subprocess
 import tomllib
@@ -472,40 +473,88 @@ def test_install_then_remove_round_trips_to_the_original(tmp_path):
 
 # --- the plugin manifest is a render, not a copy (WI-0008, ADR-0002 §5) ---
 
-MANIFEST_PATH = Path(__file__).resolve().parent.parent / "plugin" / ".claude-plugin" / "plugin.json"
+REPO = Path(__file__).resolve().parent.parent
 
 
-def test_the_checked_in_manifest_matches_what_wiring_renders():
-    """The whole point of WI-0008. The plugin is the only channel that installs
-    the HOOKS as well as the server, so a manifest that drifts from `init`'s hook
-    text ships two different cleanup contracts under one name. This test is what
-    makes the checked-in file a render rather than a hand-kept second copy —
-    regenerate with `wiring.render_plugin_manifest()`, never by editing."""
-    assert MANIFEST_PATH.read_text() == wiring.render_plugin_manifest()
+@pytest.mark.parametrize("rel", sorted(wiring.GENERATED_FILES))
+def test_every_checked_in_generated_file_matches_what_wiring_renders(rel):
+    """The whole point of WI-0008, now for every generated file (ADR-0018 §9).
+    The plugin is the only channel that installs the HOOKS as well as the
+    server, so a file that drifts from `init`'s hook text ships two different
+    cleanup contracts under one name. This test is what makes each checked-in
+    file a render rather than a hand-kept second copy — regenerate with
+    `wiring.write_generated_files(repo_root)`, never by editing."""
+    assert (REPO / rel).read_text() == wiring.GENERATED_FILES[rel]()
+
+
+def test_the_generated_file_map_covers_both_manifests_the_hooks_and_the_marketplace():
+    assert set(wiring.GENERATED_FILES) == {
+        "plugin/.claude-plugin/plugin.json",
+        "plugin/.codex-plugin/plugin.json",
+        "plugin/hooks/hooks.json",
+        ".claude-plugin/marketplace.json",
+    }
+
+
+def test_write_generated_files_renders_every_file(tmp_path):
+    written = wiring.write_generated_files(tmp_path)
+    assert sorted(p.relative_to(tmp_path).as_posix() for p in written) == sorted(wiring.GENERATED_FILES)
+    for rel, render in wiring.GENERATED_FILES.items():
+        assert (tmp_path / rel).read_text() == render()
 
 
 def _plugin_command(event):
-    return wiring.plugin_manifest()["hooks"][event][0]["hooks"][0]["command"]
+    return wiring.plugin_hooks_fragment()[event][0]["hooks"][0]["command"]
 
 
 def _init_command(event):
     return wiring.hooks_fragment()[event][0]["hooks"][0]["command"]
 
 
-def test_the_manifest_hooks_run_the_same_commands_init_writes():
+def test_the_plugin_hooks_run_the_same_commands_init_writes():
     """The plugin wraps each hook in a CLI-present guard (ADR-0015), and the
-    guarded branch must be the `init` command verbatim — two delivery paths, one
-    teardown. Everything but the command is identical."""
-    manifest = wiring.plugin_manifest()
+    guarded branch is the `init` command — two delivery paths, one teardown.
+    The one sanctioned difference (ADR-0018 §2) is how SessionEnd names the
+    project directory, so it resolves under Codex too; and SessionEnd's timeout
+    is Codex's 3 s clamp."""
+    plugin = wiring.plugin_hooks_fragment()
     init = wiring.hooks_fragment()
-    assert set(manifest["hooks"]) == set(init)
+    assert set(plugin) == set(init)
+    neutral = '"${CLAUDE_PROJECT_DIR:-$(pwd -P)}"'
     for event in init:
-        assert f"then {_init_command(event)}; else" in _plugin_command(event)
-        plugin_hook = dict(manifest["hooks"][event][0]["hooks"][0], command=None)
-        init_hook = dict(init[event][0]["hooks"][0], command=None)
+        expected = _init_command(event).replace('"$CLAUDE_PROJECT_DIR"', neutral)
+        if event == "SessionStart":
+            # WI-0086: the sweep's JSON is not hook output (Codex rejects it).
+            expected += " >/dev/null"
+        assert f"then {expected}; else" in _plugin_command(event)
+        plugin_hook = dict(plugin[event][0]["hooks"][0], command=None, timeout=None)
+        init_hook = dict(init[event][0]["hooks"][0], command=None, timeout=None)
         assert plugin_hook == init_hook
-        assert manifest["hooks"][event][0]["matcher"] == init[event][0]["matcher"]
-    assert manifest["mcpServers"][wiring.SERVER_NAME] == wiring.mcp_fragment()
+        assert plugin[event][0]["matcher"] == init[event][0]["matcher"]
+    assert plugin["SessionEnd"][0]["hooks"][0]["timeout"] == 3
+    assert plugin["SessionStart"][0]["hooks"][0]["timeout"] == runtimes.HOOK_TIMEOUT
+    assert plugin["SessionStart"][0]["matcher"] == "startup"
+    assert wiring.plugin_manifest()["mcpServers"][wiring.SERVER_NAME] == wiring.mcp_fragment()
+    assert wiring.codex_plugin_manifest()["mcpServers"][wiring.SERVER_NAME] == wiring.mcp_fragment()
+
+
+def test_the_session_end_hook_never_names_a_bare_project_dir():
+    """Codex leaves $CLAUDE_PROJECT_DIR empty (verified, codex-cli 0.153.4), so a
+    bare expansion ran `rent down --all --cwd ""` there. Every mention must
+    carry a default."""
+    command = _plugin_command("SessionEnd")
+    assert "CLAUDE_PROJECT_DIR" in command
+    assert '"$CLAUDE_PROJECT_DIR"' not in command
+    assert re.search(r"\$CLAUDE_PROJECT_DIR\b", command) is None
+    assert re.findall(r"\$\{CLAUDE_PROJECT_DIR[^}]*\}", command) == ["${CLAUDE_PROJECT_DIR:-$(pwd -P)}"]
+
+
+def test_the_session_end_hook_is_a_spelling_released_clis_accept():
+    """ADR-0018 §2: a plugin upgraded ahead of the package must still clean up,
+    so the teardown uses only `down --all --cwd … --reason session-end`."""
+    assert wiring.PLUGIN_SESSION_END_COMMAND == (
+        'rent down --all --cwd "${CLAUDE_PROJECT_DIR:-$(pwd -P)}" --reason session-end'
+    )
 
 
 def test_the_init_hooks_stay_bare_so_ownership_still_matches():
@@ -534,14 +583,19 @@ def test_the_session_end_hook_checks_for_the_cli_and_names_the_fix():
     assert wiring.INSTALL_COMMAND in command
 
 
-def _run_hook(command, bindir, project_dir):
+def _run_hook(command, bindir, project_dir, cwd=None):
     """Run a generated hook exactly as Claude Code does on macOS/Linux — `sh -c`
     — with PATH reduced to ``bindir``. `sh` itself is named by absolute path so
     the reduced PATH cannot stop the shell from starting; everything the missing
-    branch needs is a builtin."""
+    branch needs is a builtin. ``project_dir=None`` runs it as Codex does: no
+    CLAUDE_PROJECT_DIR, the session directory as the hook's cwd."""
+    env = {"PATH": str(bindir)}
+    if project_dir is not None:
+        env["CLAUDE_PROJECT_DIR"] = str(project_dir)
     return subprocess.run(
         ["/bin/sh", "-c", command],
-        env={"PATH": str(bindir), "CLAUDE_PROJECT_DIR": str(project_dir)},
+        env=env,
+        cwd=cwd,
         capture_output=True,
         text=True,
         timeout=10,
@@ -581,7 +635,8 @@ def _fake_rent(bindir):
     must not run teardown against anything."""
     bindir.mkdir()
     fake = bindir / wiring.COMMAND
-    fake.write_text('#!/bin/sh\nprintf "%s|" "$@"\n')
+    log = bindir / "argv.log"
+    fake.write_text(f'#!/bin/sh\nprintf "%s|" "$@"\nprintf "%s|" "$@" >> "{log}"\n')
     fake.chmod(0o755)
 
 
@@ -589,7 +644,11 @@ def test_session_start_with_the_cli_runs_the_sweep(tmp_path):
     _fake_rent(tmp_path / "bin")
     proc = _run_hook(_plugin_command("SessionStart"), tmp_path / "bin", tmp_path)
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == "sweep|"
+    # The sweep ran (its argv lands in the log) and printed NOTHING on the
+    # hook's stdout: Codex parses SessionStart stdout as hook JSON and showed
+    # "Hook failed" on every healthy session when the sweep's result was there.
+    assert proc.stdout == ""
+    assert (tmp_path / "bin" / "argv.log").read_text() == "sweep|"
 
 
 def test_session_end_with_the_cli_runs_the_teardown_for_this_project(tmp_path):
@@ -600,18 +659,73 @@ def test_session_end_with_the_cli_runs_the_teardown_for_this_project(tmp_path):
     assert proc.stdout == f"down|--all|--cwd|{project}|--reason|session-end|"
 
 
-def test_the_manifest_hooks_are_not_wrapped_in_a_settings_file_envelope():
-    """The defect that shipped in 1.0.0. `hooks` here is the event map itself;
-    the `{"hooks": {...}}` envelope is the *settings file* shape. Wrapped, Claude
-    Code reads `hooks` as the event name, matches nothing, and ignores every entry
-    at runtime — so the plugin installs no cleanup while looking installed. That
-    is the one failure mode the plugin channel exists to remove.
+def test_session_end_under_codex_tears_down_the_hooks_cwd(tmp_path):
+    """Codex sets no CLAUDE_PROJECT_DIR and runs the hook in the session cwd,
+    which is also rent-mcp's cwd — so the lease key the teardown names matches
+    the one env_up leased under."""
+    _fake_rent(tmp_path / "bin")
+    project = tmp_path / "codex project"
+    project.mkdir()
+    proc = _run_hook(_plugin_command("SessionEnd"), tmp_path / "bin", None, cwd=project)
+    assert proc.returncode == 0, proc.stderr
+    real = os.path.realpath(project)
+    assert proc.stdout == f"down|--all|--cwd|{real}|--reason|session-end|"
 
-    Asserted on the KEYS rather than the nesting, so any future envelope fails
-    too: every key here must be a real hook event."""
-    hooks = wiring.plugin_manifest()["hooks"]
-    assert "hooks" not in hooks
-    assert set(hooks) == {"SessionEnd", "SessionStart"}
+
+def test_session_end_with_an_empty_project_dir_still_names_a_directory(tmp_path):
+    """`:-` (not `-`): an exported-but-empty variable falls back too."""
+    _fake_rent(tmp_path / "bin")
+    proc = _run_hook(_plugin_command("SessionEnd"), tmp_path / "bin", "", cwd=tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert f"--cwd|{os.path.realpath(tmp_path)}|" in proc.stdout
+
+
+def test_no_manifest_carries_a_hooks_key():
+    """ADR-0018 §1 — the 1.0.0 and Codex lessons in one assertion. Inline hooks
+    in the Claude manifest would be MERGED with hooks/hooks.json by Claude Code
+    (every hook firing twice), are ignored by Codex (1.1.0 installed into Codex
+    with no cleanup), and a `hooks` key fails Codex's validator. The hooks live
+    in exactly one place: hooks/hooks.json."""
+    assert "hooks" not in wiring.plugin_manifest()
+    assert "hooks" not in wiring.codex_plugin_manifest()
+    for rel in ("plugin/.claude-plugin/plugin.json", "plugin/.codex-plugin/plugin.json"):
+        assert "hooks" not in json.loads((REPO / rel).read_text()), rel
+
+
+def test_the_hooks_file_is_the_wrapped_shape():
+    """`hooks/hooks.json` needs the `{"hooks": {...}}` envelope in BOTH clients
+    (Claude Code: `hooks.json must have hooks`; Codex reads only this shape). The
+    inverse of 1.0.0's defect, which put this shape inline where the bare event
+    map belongs. Asserted on the keys at both levels, so any other envelope or
+    a bare map fails."""
+    data = wiring.plugin_hooks_file()
+    assert set(data) == {"hooks"}
+    assert set(data["hooks"]) == {"SessionEnd", "SessionStart"}
+    assert data["hooks"] == wiring.plugin_hooks_fragment()
+    on_disk = json.loads((REPO / "plugin" / "hooks" / "hooks.json").read_text())
+    assert set(on_disk) == {"hooks"}
+    assert set(on_disk["hooks"]) == {"SessionEnd", "SessionStart"}
+
+
+def test_the_codex_manifest_satisfies_the_codex_validator_contract():
+    """What Codex's bundled validate_plugin.py requires (integrations/contracts/
+    codex.md), restated so the suite catches a regression without Codex."""
+    m = wiring.codex_plugin_manifest()
+    allowed = {"id", "name", "version", "description", "skills", "apps", "mcpServers",
+               "interface", "author", "homepage", "repository", "license", "keywords"}
+    assert set(m) <= allowed
+    assert re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", m["version"])
+    assert m["version"] == rentctl.__version__
+    assert m["skills"] == "./skills/"
+    assert m["mcpServers"] == {"rentctl": {"command": "rent-mcp", "args": []}}
+    ui = m["interface"]
+    for key in ("displayName", "shortDescription", "longDescription", "developerName", "category"):
+        assert isinstance(ui[key], str) and ui[key].strip(), key
+    assert ui["capabilities"] == ["Interactive"]
+    assert 1 <= len(ui["defaultPrompt"]) <= 3
+    assert all(len(p) <= 128 for p in ui["defaultPrompt"])
+    for shared in ("name", "description", "license", "keywords", "repository"):
+        assert m[shared] == wiring.plugin_manifest()[shared], shared
 
 
 def test_the_manifest_carries_the_only_required_field():
@@ -631,6 +745,11 @@ MARKETPLACE_PATH = Path(__file__).resolve().parent.parent / ".claude-plugin" / "
 
 def test_the_checked_in_marketplace_matches_what_wiring_renders():
     assert MARKETPLACE_PATH.read_text() == wiring.render_marketplace_manifest()
+
+
+def test_the_marketplace_names_both_clients():
+    description = wiring.marketplace_manifest()["description"]
+    assert "Claude Code" in description and "Codex" in description
 
 
 def test_the_marketplace_lists_the_plugin_it_ships():

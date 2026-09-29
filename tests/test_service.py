@@ -1844,7 +1844,7 @@ def test_session_end_hands_a_legacy_lease_to_a_recovery_supervisor(
     It spawns a detached recovery supervisor, which finishes the stop."""
     world.add_legacy_workload(LEGACY_PID, LEGACY_START)
     path = write_legacy(devctl_home, clock)
-    res = service.env_down(cwd="/proj/webapp", reason="session-end")
+    res = service.env_down(cwd="/proj/webapp", reason="session-end", session="old")
     (row,) = res["downed"]
     assert row["pending"] is True and "recovery supervisor" in row["detail"]
     ((ref, key, gen, reason, source, op),) = world.recoveries
@@ -1861,7 +1861,7 @@ def test_a_legacy_lease_whose_workload_is_gone_is_cleaned_without_a_stop(
     service, devctl_home, world, clock
 ):
     path = write_legacy(devctl_home, clock)  # no workload in the table
-    res = service.env_down(cwd="/proj/webapp", reason="session-end")
+    res = service.env_down(cwd="/proj/webapp", reason="session-end", session="old")
     assert [d["stopped"] for d in res["downed"]] == [True]
     assert [d["was_running"] for d in res["downed"]] == [False]
     assert not path.exists() and world.recoveries == []
@@ -2266,7 +2266,7 @@ def test_down_when_no_recovery_supervisor_can_start_says_so(service, devctl_home
     world.add_legacy_workload(LEGACY_PID, LEGACY_START)
     write_legacy(devctl_home, clock)
     world.spawn_error = DevctlError(SUPERVISOR_START_FAILED, "fork failed")
-    res = service.env_down(cwd="/proj/webapp", reason="session-end")
+    res = service.env_down(cwd="/proj/webapp", reason="session-end", session="old")
     (row,) = res["downed"]
     assert row["pending"] is True
     assert "next `rent sweep` resumes it" in row["detail"]

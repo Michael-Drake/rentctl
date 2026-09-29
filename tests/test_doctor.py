@@ -30,6 +30,7 @@ def no_real_claude_home(tmp_path, monkeypatch):
     managed-settings file, so no test here answers differently on a machine
     where the plugin really is installed — the developer's own, for one."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setattr(wiring, "MANAGED_SETTINGS_FILES", ())
 
 
@@ -578,3 +579,147 @@ def test_main_prints_json_and_returns_the_exit_code(capsys, devctl_home, monkeyp
     parsed = json.loads(out)
     assert parsed["ok"] is False
     assert code == 1
+
+
+# --- Codex (ADR-0018 §8) ---------------------------------------------------
+
+TRUSTED = """
+[hooks.state."rentctl@rentctl:hooks/hooks.json:session_start:0:0"]
+trusted_hash = "sha256:aaa"
+
+[hooks.state."rentctl@rentctl:hooks/hooks.json:session_end:0:0"]
+trusted_hash = "sha256:bbb"
+"""
+
+
+def _codex(tmp_path, text=None):
+    home = tmp_path / "codex-home"
+    home.mkdir(exist_ok=True)
+    if text is not None:
+        (home / "config.toml").write_text(text)
+    return home
+
+
+def _by_name(checks):
+    return {c.name: c for c in checks}
+
+
+def test_codex_home_honours_the_env_variable(tmp_path):
+    assert doctor.codex_home({"CODEX_HOME": str(tmp_path)}) == tmp_path
+    assert doctor.codex_home({}) == Path.home() / ".codex"
+    assert doctor.codex_home({"CODEX_HOME": "  "}) == Path.home() / ".codex"
+
+
+def test_codex_is_present_by_binary_or_by_home(tmp_path):
+    missing = tmp_path / "nope"
+    assert doctor.codex_present(missing, which=lambda _c: None) is False
+    assert doctor.codex_present(missing, which=lambda _c: "/usr/local/bin/codex") is True
+    assert doctor.codex_present(_codex(tmp_path), which=lambda _c: None) is True
+
+
+def test_codex_without_config_is_simply_not_installed(tmp_path):
+    (check,) = doctor.check_codex(_codex(tmp_path))
+    assert check.name == "codex:plugin" and check.status == OK
+    assert "not installed" in check.detail and "codex plugin add rentctl@rentctl" in check.detail
+
+
+def test_codex_config_without_the_plugin_is_ok_and_names_the_install(tmp_path):
+    (check,) = doctor.check_codex(_codex(tmp_path, 'model = "x"\n[plugins."other@m"]\nenabled = true\n'))
+    assert check.status == OK and "not installed" in check.detail
+
+
+def test_a_non_table_plugins_key_holds_no_rentctl_plugin(tmp_path):
+    (check,) = doctor.check_codex(_codex(tmp_path, 'plugins = "rentctl@rentctl"\n'))
+    assert check.status == OK and "not installed" in check.detail
+
+
+def test_an_unreadable_codex_config_is_couldnt_tell(tmp_path):
+    """declare-what-a-check-assumes: an unparseable file is not "not installed"."""
+    (check,) = doctor.check_codex(_codex(tmp_path, "this is = = not toml ["))
+    assert check.status == UNKNOWN and check.detail.startswith("couldn't tell")
+
+
+def test_enabled_trusted_unshadowed_plugin_is_all_ok(tmp_path):
+    home = _codex(tmp_path, '[plugins."rentctl@rentctl"]\nenabled = true\n' + TRUSTED)
+    checks = _by_name(doctor.check_codex(home))
+    assert set(checks) == {"codex:plugin", "codex:hooks", "codex:mcp-shadow"}
+    assert all(c.status == OK for c in checks.values()), checks
+    assert "trust entry present" in checks["codex:hooks"].detail
+
+
+def test_any_marketplace_counts(tmp_path):
+    home = _codex(tmp_path, '[plugins."rentctl@my-fork"]\nenabled = true\n' + TRUSTED.replace(
+        "rentctl@rentctl", "rentctl@my-fork"))
+    checks = _by_name(doctor.check_codex(home))
+    assert checks["codex:plugin"].status == OK and "rentctl@my-fork" in checks["codex:plugin"].detail
+    assert checks["codex:hooks"].status == OK
+
+
+def test_a_disabled_plugin_warns(tmp_path):
+    home = _codex(tmp_path, '[plugins."rentctl@rentctl"]\nenabled = false\n' + TRUSTED)
+    checks = _by_name(doctor.check_codex(home))
+    assert checks["codex:plugin"].status == WARN and "disabled" in checks["codex:plugin"].detail
+
+
+def test_a_plugin_entry_without_enabled_is_couldnt_tell(tmp_path):
+    home = _codex(tmp_path, '[plugins."rentctl@rentctl"]\n' + TRUSTED)
+    checks = _by_name(doctor.check_codex(home))
+    assert checks["codex:plugin"].status == UNKNOWN
+
+
+def test_untrusted_hooks_warn_and_name_the_fix(tmp_path):
+    """Codex runs no hook until it is trusted in /hooks, plugin hooks included."""
+    home = _codex(tmp_path, '[plugins."rentctl@rentctl"]\nenabled = true\n')
+    checks = _by_name(doctor.check_codex(home))
+    hooks = checks["codex:hooks"]
+    assert hooks.status == WARN
+    assert "run /hooks in Codex" in hooks.detail and "lease expiry" in hooks.detail
+    assert "session_start" in hooks.detail and "session_end" in hooks.detail
+
+
+def test_half_trusted_hooks_warn_naming_the_missing_event(tmp_path):
+    only_start = TRUSTED.split("[hooks.state.\"rentctl@rentctl:hooks/hooks.json:session_end")[0]
+    home = _codex(tmp_path, '[plugins."rentctl@rentctl"]\nenabled = true\n' + only_start)
+    hooks = _by_name(doctor.check_codex(home))["codex:hooks"]
+    assert hooks.status == WARN and "session_end" in hooks.detail and "session_start" not in hooks.detail
+
+
+def test_an_empty_trusted_hash_is_not_trust(tmp_path):
+    home = _codex(tmp_path, '[plugins."rentctl@rentctl"]\nenabled = true\n'
+                  + TRUSTED.replace('"sha256:bbb"', '""'))
+    assert _by_name(doctor.check_codex(home))["codex:hooks"].status == WARN
+
+
+def test_a_malformed_hooks_state_is_couldnt_tell(tmp_path):
+    home = _codex(tmp_path, '[plugins."rentctl@rentctl"]\nenabled = true\n[hooks]\nstate = 3\n')
+    assert _by_name(doctor.check_codex(home))["codex:hooks"].status == UNKNOWN
+
+
+def test_a_config_mcp_server_shadowing_the_plugin_warns(tmp_path):
+    home = _codex(tmp_path, '[plugins."rentctl@rentctl"]\nenabled = true\n' + TRUSTED
+                  + '\n[mcp_servers.rentctl]\ncommand = "rent-mcp"\n')
+    shadow = _by_name(doctor.check_codex(home))["codex:mcp-shadow"]
+    assert shadow.status == WARN
+    assert "[mcp_servers.rentctl]" in shadow.detail and "delete" in shadow.detail
+
+
+def test_diagnose_includes_codex_only_when_codex_is_present(devctl_home, write_registry, tmp_path, monkeypatch):
+    write_registry({"projects": {}})
+    monkeypatch.setattr(doctor.shutil, "which", lambda c: None if c == "codex" else "/usr/local/bin/rent")
+    report = doctor.diagnose(devctl_home, runner=runner_returning(0, '{"ok": true}'),
+                             codex_home_dir=tmp_path / "absent")
+    assert not any(c.name.startswith("codex") for c in report.checks)
+
+    home = _codex(tmp_path, '[plugins."rentctl@rentctl"]\nenabled = true\n')
+    report = doctor.diagnose(devctl_home, runner=runner_returning(0, '{"ok": true}'), codex_home_dir=home)
+    names = [c.name for c in report.checks]
+    assert {"codex:plugin", "codex:hooks", "codex:mcp-shadow"} <= set(names)
+
+
+def test_diagnose_reads_codex_home_from_the_environment(devctl_home, write_registry, tmp_path, monkeypatch):
+    write_registry({"projects": {}})
+    monkeypatch.setattr(doctor.shutil, "which", lambda c: None if c == "codex" else "/usr/local/bin/rent")
+    home = _codex(tmp_path, '[plugins."rentctl@rentctl"]\nenabled = false\n')
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    report = doctor.diagnose(devctl_home, runner=runner_returning(0, '{"ok": true}'))
+    assert _by_name(report.checks)["codex:plugin"].status == WARN

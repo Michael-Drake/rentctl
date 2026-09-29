@@ -1,0 +1,41 @@
+{
+  "name": "rentctl",
+  "version": "1.2.0",
+  "description": "Leased dev environments for AI coding sessions — every server dies when its session ends, so none are left running rogue.",
+  "author": {
+    "name": "Michael Drake",
+    "url": "https://github.com/Michael-Drake"
+  },
+  "homepage": "https://github.com/Michael-Drake/rentctl",
+  "repository": "https://github.com/Michael-Drake/rentctl",
+  "license": "Apache-2.0",
+  "keywords": [
+    "dev-server",
+    "lease",
+    "cleanup",
+    "mcp",
+    "ports"
+  ],
+  "skills": "./skills/",
+  "mcpServers": {
+    "rentctl": {
+      "command": "rent-mcp",
+      "args": []
+    }
+  },
+  "interface": {
+    "displayName": "rentctl",
+    "shortDescription": "Leased dev servers that die when the session ends",
+    "longDescription": "rentctl starts your project's dev server on a leased port and stops it when the Codex session ends, so no server is left running rogue. The plugin adds the env_up / env_down / env_ls / env_sweep tools and the session hooks; it runs the rentctl CLI installed on this machine (uv tool install rentctl).",
+    "developerName": "Michael Drake",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "Run this app",
+      "Why won't my dev server start?",
+      "Stop the dev server for this project"
+    ]
+  }
+}

@@ -42,14 +42,17 @@ registry would defeat rentctl's whole purpose. Raised with the spec author as a 
 
 from __future__ import annotations
 
+import json
 import os
+import select
 import signal
 import socket
+import sys
 import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -64,14 +67,17 @@ from .errors import (
     CLEANUP_INCOMPLETE,
     CMD_CHANGED,
     INVALID_CWD,
+    NOT_A_PROJECT,
     PROFILE_MISMATCH,
     START_TIMEOUT,
     STATE_WRITE_FAILED,
     STOP_IN_PROGRESS,
     SUPERVISOR_START_FAILED,
+    UNKNOWN_PROJECT,
     UNSUPPORTED_ENVIRONMENT,
     DevctlError,
 )
+from .project_config import TOML_NAME, ProjectConfig
 from .events import EventLog
 from .leases import CleanupRecord, Lease, ProcessRef, SupervisorRef, list_lease_files
 from .lifecycle import (
@@ -111,7 +117,7 @@ from .supervision import (
     RecoveryResult,
 )
 from .workload import KILL_GRACE_S, TERM_GRACE_S
-from .worktree import resolve_spawn_cwd
+from .worktree import checkout_root, resolve_spawn_cwd
 
 DEFAULT_LEASE_MINUTES = 120
 MAX_LEASE_MINUTES = 480
@@ -169,7 +175,35 @@ PROJECT_DIR_ENVS = ("DEVCTL_PROJECT_DIR", "CLAUDE_PROJECT_DIR", "GEMINI_PROJECT_
 #   GEMINI_SESSION_ID       — documented by gemini-cli 0.35.2 in its own bundled
 #                             docs (docs/hooks/index.md: "The unique ID for the
 #                             current session"). Contract, not observation.
-SESSION_ID_ENVS = ("DEVCTL_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "GEMINI_SESSION_ID")
+#   CODEX_THREAD_ID         — verified live 2026-09-29 on codex-cli 0.153.4: set
+#                             in the environment of the agent's shell commands,
+#                             and equal to the hook stdin `session_id` and to the
+#                             MCP `tools/call` `_meta.threadId`. Codex does NOT set
+#                             it for hooks or MCP servers (their env is an
+#                             allow-list); rent-mcp reads `_meta` per call instead
+#                             (ADR-0018 §4). Observation, not contract.
+SESSION_ID_ENVS = (
+    "DEVCTL_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "GEMINI_SESSION_ID", "CODEX_THREAD_ID",
+)
+
+# --- session identity for a hook (ADR-0017 §2) ------------------------------------
+# A hook's contract channel is JSON on stdin with a `session_id` field. It is read
+# only by the hook-shaped commands (`down --reason session-end`, `sweep`), only
+# when stdin is not a terminal, and never for longer or larger than this: a hook
+# has a 1.5 s budget and must never fail on its input.
+HOOK_STDIN_MAX_BYTES = 64 * 1024
+HOOK_STDIN_TIMEOUT_S = 0.5
+# A session id is a claim key and is echoed back in envelopes and events; a value
+# longer than this, or with control characters, is not an id and is ignored.
+_MAX_SESSION_ID_LEN = 256
+
+# Where a resolved session id came from: this, or the env variable's own name.
+SESSION_SOURCE_STDIN = "stdin"
+SESSION_SOURCE_UNKNOWN = "unknown"
+
+# How a claim was taken (`claims[id].via`).
+VIA_CLI = "cli"
+VIA_MCP = "mcp"
 
 
 def _first_env(names: tuple[str, ...]) -> str | None:
@@ -179,6 +213,84 @@ def _first_env(names: tuple[str, ...]) -> str | None:
         if value:
             return value
     return None
+
+
+def _valid_session_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > _MAX_SESSION_ID_LEN or not value.isprintable():
+        return None
+    return value
+
+
+def read_hook_session(
+    stream: Any = None,
+    *,
+    timeout_s: float = HOOK_STDIN_TIMEOUT_S,
+    max_bytes: int = HOOK_STDIN_MAX_BYTES,
+) -> str | None:
+    """The ``session_id`` of a hook's JSON stdin, or ``None``. Never raises.
+
+    ``None`` covers every way it can be absent: a terminal (not read at all),
+    no stdin, empty input, input that is not JSON or not an object, a missing
+    or non-string ``session_id``, more than ``max_bytes``, and a stdin that has
+    not reached EOF within ``timeout_s``. Each falls through silently to the env
+    list, because a hook must never fail on its input (ADR-0017 §2).
+    """
+    try:
+        stream = sys.stdin if stream is None else stream
+        if stream is None or stream.isatty():
+            return None
+        fd = stream.fileno()
+        deadline = time.monotonic() + timeout_s
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            readable, _, _ = select.select([fd], [], [], remaining)
+            if not readable:
+                return None
+            chunk = os.read(fd, min(65536, max_bytes + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                return None
+            chunks.append(chunk)
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+        if not isinstance(payload, dict):
+            return None
+        return _valid_session_id(payload.get("session_id"))
+    except Exception:  # noqa: BLE001 - a hook must never fail on its input
+        return None
+
+
+def resolve_session(*, from_hook: bool = False, stream: Any = None) -> tuple[str, str]:
+    """``(session_id, source)`` for the calling process (ADR-0017 §2).
+
+    In order: hook stdin (only when ``from_hook``), then each of
+    :data:`SESSION_ID_ENVS`, then ``unknown``. ``source`` is
+    :data:`SESSION_SOURCE_STDIN`, the env variable's name, or
+    :data:`SESSION_SOURCE_UNKNOWN`. The list is read at call time, so a runtime
+    wired later by appending its variable is honoured here.
+    """
+    if from_hook:
+        sid = read_hook_session(stream)
+        if sid is not None:
+            return sid, SESSION_SOURCE_STDIN
+    for name in SESSION_ID_ENVS:
+        value = _valid_session_id(os.environ.get(name))
+        if value is not None:
+            return value, name
+    return ev.UNATTRIBUTED, SESSION_SOURCE_UNKNOWN
+
+
+def caller_session(*, from_hook: bool = False, stream: Any = None) -> str:
+    """The session id to claim and attribute under (ADR-0017 §2, ADR-0011 §4)."""
+    return resolve_session(from_hook=from_hook, stream=stream)[0]
 
 
 def _now_local() -> datetime:
@@ -338,6 +450,21 @@ class _StopTarget:
     retry_after_attempt: int | None = None
     row: dict[str, Any] | None = None         # set once the answer is known
     extra: dict[str, Any] = field(default_factory=dict)
+    # ADR-0017 §9 fields every row for this lease carries: `released_by`,
+    # `overrode_claims`.
+    claim_fields: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _ClaimOp:
+    """What a ``down`` means for claims (ADR-0017 §4).
+
+    ``release``: remove ``caller``'s claim and stop only if it was the last one.
+    Otherwise a deliberate stop, which names the other claims it overrode.
+    """
+
+    caller: str
+    release: bool
 
 
 class Service:
@@ -362,6 +489,7 @@ class Service:
         supervision: OsSupervision | None = None,
         term_grace_s: float = TERM_GRACE_S,
         kill_grace_s: float = KILL_GRACE_S,
+        via: str = VIA_CLI,
     ) -> None:
         self.paths = paths or DevctlPaths.default()
         self.paths.ensure_dirs()
@@ -374,6 +502,8 @@ class Service:
         # probed there (§6 step 3), not here.
         self.readiness_timeout = readiness_timeout
         self.session_id_fn = session_id_fn or self._caller_session
+        # Which front end this service answers for, recorded on each claim.
+        self.via = via
         self.events = event_log or EventLog(self.paths.events_file, now_fn=now_fn)
         self.supervision = supervision or OsSupervision()
         # The grace periods of every stop this service causes: they ride in the
@@ -501,16 +631,27 @@ class Service:
 
     def env_up(
         self,
-        project: str,
+        project: str | None = None,
         lease_minutes: int = DEFAULT_LEASE_MINUTES,
         profile: str = "default",
         cwd: str | None = None,
+        *,
+        session: str | None = None,
     ) -> dict[str, Any]:
+        """Start or renew the caller's claim on a project's environment.
+
+        ``session`` is the caller's id when the caller already resolved it (the
+        MCP server reads it per call from Codex's ``_meta``, ADR-0018 §4);
+        otherwise it is resolved here, from the environment — as ``env_down``.
+        """
+        resolved_from: str | None = None
         try:
             self._check_cwd(cwd)
+            if project is None:
+                project, resolved_from = self._project_of_checkout(cwd or self._caller_cwd())
             minutes = self._clamp_lease(lease_minutes)
             registry = self._load_registry()
-            entry = registry.entry(project)
+            entry = self._entry_for(registry, project, resolved_from)
             # The approved-command pin, checked before anything is started
             # (ADR-0003 §4). A repo whose devctl.toml changed since enrollment
             # stops here with CMD_CHANGED rather than executing the new command.
@@ -522,12 +663,18 @@ class Service:
             # Identity is (project, cwd): each worktree of a project gets its own
             # lease, so a second lane starts its own server instead of being
             # handed this one's (ADR-0007).
-            target_cwd = os.path.realpath(cwd or self._caller_cwd())
+            target_cwd = checkout_root(cwd or self._caller_cwd())
             key = lease_key(project, target_cwd)
-            return self._up(entry, prof, profile, minutes, target_cwd, key)
+            # Resolved once per call: the claim this `up` adds or renews (ADR-0017 §3).
+            caller = session or self.session_id_fn()
+            return self._up(entry, prof, profile, minutes, target_cwd, key, caller)
         except _Reported as e:
             return e.to_envelope()
         except DevctlError as e:
+            if project is None:
+                # Nothing was named and nothing could be resolved: there is no
+                # project to attribute a refused start to, so no event.
+                return e.to_envelope()
             # A refused start is evidence too: it separates "this project never
             # used rentctl" from "it tried and the port was squatted" (spec §9).
             self.events.record_up_failed(
@@ -535,6 +682,48 @@ class Service:
                 generation=e.details.get("generation"), phase=e.details.get("phase"),
             )
             return e.to_envelope()
+
+    @staticmethod
+    def _project_of_checkout(start: str) -> tuple[str, str]:
+        """The project a checkout declares: the nearest ``rentctl.toml`` at or above ``start``.
+
+        An agent asked to "run this app" knows where it is standing, not the
+        registry key. The file is tracked, so every worktree of a project carries
+        it and resolves to the same name; the lease is still keyed on the caller's
+        own directory (ADR-0007). Reading the name is all this does — enrollment
+        state and the approved command are checked by the caller as for a named
+        project, so resolution cannot widen what runs.
+        """
+        here = Path(os.path.realpath(start))
+        for d in (here, *here.parents):
+            if ProjectConfig.exists_in(d):
+                return ProjectConfig.load(d).name, str(ProjectConfig.path_in(d))
+        raise DevctlError(
+            NOT_A_PROJECT,
+            f"no {TOML_NAME} at or above {here} — this checkout is not set up for rentctl. "
+            "Enrolling it is a person's decision: they add a rentctl.toml describing the "
+            "dev command and run `rent init`, which shows the command and asks them to "
+            "approve it.",
+            searched_from=str(here),
+        )
+
+    @staticmethod
+    def _entry_for(registry: Registry, project: str, resolved_from: str | None) -> RegistryEntry:
+        """``registry.entry``, with the enrollment answer spelled out for a resolved project."""
+        try:
+            return registry.entry(project)
+        except DevctlError as e:
+            if resolved_from is None or e.code != UNKNOWN_PROJECT:
+                raise
+            raise DevctlError(
+                UNKNOWN_PROJECT,
+                f"{resolved_from} declares project {project!r}, but it is not enrolled on "
+                "this machine. Enrolling is a person's decision: they run `rent init` in "
+                "the project root, which shows the exact command and asks them to approve "
+                "it. Do not start the server by hand instead.",
+                resolved_from=resolved_from,
+                enrolled=False,
+            ) from None
 
     def _require_process_inspection(self) -> None:
         """Refuse to start anything where the process table cannot be read.
@@ -556,18 +745,18 @@ class Service:
                 reason=denied,
             )
 
-    def _up(self, entry, prof, profile, minutes, target_cwd, key) -> dict[str, Any]:
+    def _up(self, entry, prof, profile, minutes, target_cwd, key, caller: str) -> dict[str, Any]:
         """The §6 protocol. Every locked round is bounded; every wait is lock-free."""
         for _ in range(_UP_ROUNDS):
             with self._lock(key):
-                step = self._up_locked(entry, prof, profile, minutes, target_cwd, key)
+                step = self._up_locked(entry, prof, profile, minutes, target_cwd, key, caller)
             # --- L released: nothing below holds a lock (§9 Rule 2) ---------
             if step.kind == "result":
                 assert step.result is not None
                 return step.result
             if step.kind == "started":
                 assert step.lease is not None
-                return self._await_own_start(key, step.lease, step.squatter_unverified)
+                return self._await_own_start(key, step.lease, step.squatter_unverified, caller)
             assert step.generation is not None
             if step.kind == "wait_start":
                 # §14: `up` on a `starting` lease waits for it; the next round
@@ -597,12 +786,12 @@ class Service:
             "try again when `rent ls` shows it settled",
         )
 
-    def _up_locked(self, entry, prof, profile, minutes, target_cwd, key) -> _Step:
+    def _up_locked(self, entry, prof, profile, minutes, target_cwd, key, caller: str) -> _Step:
         """One round under L: act on what is there, or write the starting lease."""
         lease_path = self.paths.lease_file(key)
         existing = Lease.read_if_exists(lease_path)
         if existing is not None:
-            step = self._up_on_existing(existing, key, profile, minutes)
+            step = self._up_on_existing(existing, key, profile, minutes, caller)
             if step is not None:
                 return step
 
@@ -636,8 +825,12 @@ class Service:
         }
         lease = new_starting_lease(
             generation=generation, project=entry.project, profile=profile, runner=entry.runner,
-            port=port, session=self.session_id_fn(), cwd=target_cwd, spawn_cwd=spawn.cwd,
+            port=port, session=caller, cwd=target_cwd, spawn_cwd=spawn.cwd,
             log=str(log_path), plan=plan, now=now, expires=now + timedelta(minutes=minutes),
+        )
+        # A fresh environment has exactly one claim: the caller's (ADR-0017 §3).
+        lease = replace(lease, claims={}).claimed(
+            caller, expires=now + timedelta(minutes=minutes), now=now, via=self.via
         )
         # §6 step 1: the record comes first. Nothing is launched until it exists.
         try:
@@ -671,9 +864,16 @@ class Service:
                 pass
         return _Step("started", lease=lease, squatter_unverified=squatter_unverified)
 
-    def _up_on_existing(self, existing: Lease, key: str, profile: str, minutes: int) -> _Step | None:
+    def _up_on_existing(
+        self, existing: Lease, key: str, profile: str, minutes: int, caller: str
+    ) -> _Step | None:
         """Decide what an existing lease means for this ``up``. ``None``: it was
-        removed under L and a fresh start may proceed."""
+        removed under L and a fresh start may proceed.
+
+        A live lease of the same profile gains or renews the caller's claim and
+        nobody else's (ADR-0017 §3). A ``stopping`` one is never claimed: the
+        ``wait_stop`` step waits for it and then starts fresh.
+        """
         state = state_of(existing)
         gen = generation_of(existing)
         path = self.paths.lease_file(key)
@@ -692,7 +892,7 @@ class Service:
         if existing.is_legacy:
             if obs.membership is Membership.MEMBERS:
                 self._check_profile(existing, profile)
-                return self._renew(existing, minutes, key)
+                return self._renew(existing, minutes, key, caller)
             if obs.membership is Membership.AMBIGUOUS:
                 raise self._ambiguous_error(existing)
             return _Step("reconcile", generation=gen)
@@ -700,7 +900,7 @@ class Service:
             if not obs.supervisor_alive:
                 return _Step("reconcile", generation=gen)
             self._check_profile(existing, profile)
-            return self._renew(existing, minutes, key)
+            return self._renew(existing, minutes, key, caller)
         if state is State.UNSUPERVISED:
             d = decide(existing, obs, self._now())
             if d.action is LifecycleAction.KEEP_AMBIGUOUS:
@@ -710,8 +910,20 @@ class Service:
             # Still serving, within its lease, and nobody supervises it. §7 has
             # no renew row for it: it runs out its lease and is then recovered.
             self._check_profile(existing, profile)
+            if existing.stop is None:
+                # The caller still gets a claim, or another session's release
+                # would count it out and stop the server under it (ADR-0017 §3).
+                # Capped at the lease's own expiry, so this is not a renewal.
+                now = self._now()
+                claimed = existing.claimed(
+                    caller, expires=min(now + timedelta(minutes=minutes), existing.expires),
+                    now=now, via=self.via,
+                )
+                if claimed != existing:
+                    claimed.write(path)
+                    existing = claimed
             return _Step("result", result=self._up_result(
-                existing, already_running=True, record=True, detail=(
+                existing, already_running=True, record=True, caller=caller, detail=(
                     "running unsupervised: its supervisor died, so this lease was not "
                     "renewed. It is stopped at its expiry by the next ls/sweep/up/down, "
                     "or now with `rent down`."
@@ -728,38 +940,54 @@ class Service:
             return _Step("wait_stop", generation=gen)
         return _Step("reconcile", generation=gen)
 
-    def _renew(self, existing: Lease, minutes: int, key: str) -> _Step:
-        """Renew a live lease under L (§7 ``running`` + RENEW; §14 legacy in place)."""
+    def _renew(self, existing: Lease, minutes: int, key: str, caller: str) -> _Step:
+        """Renew the caller's claim on a live lease under L (§7 ``running`` +
+        RENEW; §14 legacy in place; ADR-0017 §3).
+
+        Only the caller's claim moves. The lease's ``expires`` is derived from
+        every live claim, so B's ``up`` neither extends nor shortens A's.
+        """
+        now = self._now()
+        claimed = existing.claimed(
+            caller, expires=now + timedelta(minutes=minutes), now=now, via=self.via
+        )
         renewed = transition(
             existing,
-            Event(EventKind.RENEW, self._now(), expires=self._now() + timedelta(minutes=minutes)),
+            Event(EventKind.RENEW, now, expires=claimed.expires),
             Actor(ActorKind.CLI, generation_of(existing), self._me()),
         )
         if not isinstance(renewed, Lease):
             # A stop is recorded for this generation: the stop was decided first,
             # so wait for it and start fresh rather than resurrect it (#10).
             return _Step("wait_stop", generation=generation_of(existing))
+        renewed = replace(renewed, claims=claimed.claims)
         renewed.write(self.paths.lease_file(key))
-        return _Step("result", result=self._up_result(renewed, already_running=True, record=True))
+        return _Step("result", result=self._up_result(
+            renewed, already_running=True, record=True, caller=caller
+        ))
 
-    @staticmethod
-    def _check_profile(existing: Lease, profile: str) -> None:
+    def _check_profile(self, existing: Lease, profile: str) -> None:
         # A lease is keyed on (project, cwd) and carries no profile (ADR-0007),
         # so one directory holds exactly one environment. Asking for a
         # *different* profile here is a request the identity model cannot
         # satisfy — and it used to be answered with `already_running: true`
         # over the wrong server, so an agent that asked for the api profile got
-        # the plain dev one and debugged the wrong process. Refuse and say so.
+        # the plain dev one and debugged the wrong process. Refuse and say so,
+        # naming the sessions whose claims hold the running one (ADR-0017 §3).
+        # No claim is recorded for the refused caller.
         if existing.profile != profile:
+            held_by = sorted(existing.live_claims(self._now()))
+            holders = ", ".join(held_by) or "no live session"
             raise DevctlError(
                 PROFILE_MISMATCH,
                 f"{existing.project!r} already has profile {existing.profile!r} running in "
-                f"this directory on port {existing.port}; {profile!r} was requested. "
-                f"One environment per directory (ADR-0007) — stop the running one "
+                f"this directory on port {existing.port}, held by {holders}; {profile!r} was "
+                f"requested. One environment per directory (ADR-0007) — stop the running one "
                 f"first, or start this profile from a different worktree.",
                 running_profile=existing.profile,
                 requested_profile=profile,
                 port=existing.port,
+                held_by=held_by,
             )
 
     def _start_budget(self) -> float:
@@ -767,7 +995,9 @@ class Service:
         # deadline starts after it registers, so this outlasts it.
         return self.readiness_timeout + REGISTRATION_TIMEOUT.total_seconds() + 5.0
 
-    def _await_own_start(self, key: str, lease: Lease, squatter_unverified: str | None) -> dict[str, Any]:
+    def _await_own_start(
+        self, key: str, lease: Lease, squatter_unverified: str | None, caller: str
+    ) -> dict[str, Any]:
         """Wait, lock-free, for the outcome our supervisor writes (§6 step 3).
 
         The waiter reads; it never infers. ``running`` is success — the
@@ -779,7 +1009,7 @@ class Service:
             assert cur is not None
             return self._up_result(
                 cur, already_running=False, squatter_unverified=squatter_unverified,
-                readiness=self._readiness_of(cur), record=False,
+                readiness=self._readiness_of(cur), record=False, caller=caller,
             )
         if outcome is StartWait.FAILED:
             assert cur is not None
@@ -989,8 +1219,22 @@ class Service:
         reason: str | None = None,
         all_instances: bool = False,
         wait_s: float | None = None,
+        *,
+        release: bool | None = None,
+        session: str | None = None,
     ) -> dict[str, Any]:
         """Stop this cwd's instance of a project, or everything leased to ``cwd``.
+
+        **Release or stop (ADR-0017 §4).** A *release* removes only the caller's
+        claim, and the environment stops only when that was the last live claim;
+        otherwise the row says ``released``, ``stopped: false`` and ``held_by``.
+        A caller holding no claim changes nothing, and nothing is logged. A
+        *deliberate stop* stops for everyone and names the other sessions'
+        claims it overrode in ``overrode_claims``. ``release`` defaults to true
+        exactly for a declared ``session-end`` (the SessionEnd hook); the MCP
+        tool passes it explicitly. ``session`` is the caller's id when the
+        caller already resolved it (the hook's stdin); otherwise it is resolved
+        here, from the environment.
 
         ``reason`` is the caller declaring which cleanup layer it *is* — the
         SessionEnd hook passes ``session-end``, an LLM/human ``explicit``. When
@@ -1018,19 +1262,26 @@ class Service:
                 if all_instances:
                     paths = self.paths.project_lease_files(project)
                 else:
-                    target = os.path.realpath(cwd or self._caller_cwd())
+                    target = checkout_root(cwd or self._caller_cwd())
                     paths = [self.paths.lease_file_for(project, target)]
             else:
                 # No project → down everything leased to the caller's cwd (§4.2).
                 source = ev.DECLARED if declared else ev.INFERRED
                 why = reason or ev.SESSION_END
-                target = os.path.realpath(cwd or self._caller_cwd())
+                target = checkout_root(cwd or self._caller_cwd())
+                # At or under the checkout: a lease a 1.1 session keyed on its
+                # launch subdirectory is still this checkout's.
                 paths = [
                     p for p in list_lease_files(self.paths.leases_dir)
-                    if (lease := self._read_lease_quiet(p)) is not None and lease.cwd == target
+                    if (lease := self._read_lease_quiet(p)) is not None
+                    and (lease.cwd == target or lease.cwd.startswith(target.rstrip(os.sep) + os.sep))
                 ]
             budget = self._down_budget(why, source, wait_s)
-            rows = self._stop_all(paths, why, source, budget, project_hint=project)
+            claim_op = _ClaimOp(
+                caller=session or self.session_id_fn(),
+                release=(reason == ev.SESSION_END) if release is None else bool(release),
+            )
+            rows = self._stop_all(paths, why, source, budget, project_hint=project, claim_op=claim_op)
             if project is not None and not all_instances:
                 return {"ok": True, **rows[0]}
             if project is not None:
@@ -1048,7 +1299,14 @@ class Service:
         return DOWN_WAIT_S
 
     def _stop_all(
-        self, paths: list[Path], why: str, source: str, budget: float, *, project_hint: str | None
+        self,
+        paths: list[Path],
+        why: str,
+        source: str,
+        budget: float,
+        *,
+        project_hint: str | None,
+        claim_op: _ClaimOp | None = None,
     ) -> list[dict[str, Any]]:
         """Fan out every request, then wait once for all of them (§8, R0).
 
@@ -1061,7 +1319,7 @@ class Service:
         """
         clock = self.supervision
         deadline = clock.monotonic() + budget
-        targets = [self._request_stop(p, why, source, project_hint) for p in paths]
+        targets = [self._request_stop(p, why, source, project_hint, claim_op) for p in paths]
         for t in targets:
             if t.row is None and t.legacy is not None:
                 self._kill_watchdog(t.legacy)
@@ -1074,8 +1332,22 @@ class Service:
         self._await_stops(targets, deadline, why, source, actor=ev.ACTOR_CLI)
         return [t.row for t in targets if t.row is not None]
 
-    def _request_stop(self, path: Path, why: str, source: str, project_hint: str | None) -> _StopTarget:
-        """Under L: write the generation-matched stop request (§8)."""
+    def _request_stop(
+        self,
+        path: Path,
+        why: str,
+        source: str,
+        project_hint: str | None,
+        claim_op: _ClaimOp | None = None,
+    ) -> _StopTarget:
+        """Under L: settle the caller's claim, then write the generation-matched
+        stop request (§8) unless other claims still hold the lease.
+
+        The "last claim released, so stop" decision and the stop request are one
+        critical section (ADR-0017 §6): a concurrent ``up`` either adds its claim
+        before this reads the lease, and so prevents the stop, or finds the
+        stop already recorded and waits for it before starting fresh.
+        """
         key = path.stem
         me = self._me()
         with self._lock(key):
@@ -1097,6 +1369,26 @@ class Service:
                     path.unlink(missing_ok=True)
                 t.row = self._row(t, stopped=True)
                 return t
+            overrode: tuple[str, ...] | None = None
+            released_by: str | None = None
+            if claim_op is not None:
+                now = self._now()
+                live = lease.live_claims(now)
+                if claim_op.release:
+                    held = self._release_claim(t, lease, live, claim_op.caller, now, why, source)
+                    if held is not None:
+                        t.row = held
+                        return t
+                    # The caller's claim was the last one: stop, and say whose
+                    # release it was. The claim removal is written with the request.
+                    lease = lease.released(claim_op.caller, now)
+                    released_by = claim_op.caller
+                    t.claim_fields["released_by"] = released_by
+                else:
+                    others = sorted(k for k in live if k != claim_op.caller)
+                    if others:
+                        overrode = tuple(others)
+                        t.claim_fields["overrode_claims"] = others
             obs = self._observe(lease, key)
             t.was_running = obs.supervisor_alive or obs.membership is Membership.MEMBERS
             if not obs.supervisor_alive and obs.membership is Membership.AMBIGUOUS:
@@ -1117,6 +1409,12 @@ class Service:
             )
             cur = lease
             if isinstance(req, Lease) and req is not lease:
+                if lease.stop is None and req.stop is not None and (released_by or overrode):
+                    # A new request: it carries the ADR-0017 attribution to the
+                    # `down` event whoever verifies the stop will write.
+                    req = replace(req, stop=replace(
+                        req.stop, released_by=released_by, overrode_claims=overrode
+                    ))
                 req.write(path)
                 supervision.record_stop_requested(self.events, req, me)
                 cur = req
@@ -1136,6 +1434,58 @@ class Service:
             else:
                 t.needs_recovery = True
         return t
+
+    def _release_claim(
+        self,
+        t: _StopTarget,
+        lease: Lease,
+        live: dict[str, Any],
+        caller: str,
+        now: datetime,
+        why: str,
+        source: str,
+    ) -> dict[str, Any] | None:
+        """Under L: a release's answer when the lease is kept, else ``None``.
+
+        ``None`` means the caller held the last live claim and the caller must
+        request the stop (ADR-0017 §4). Otherwise the lease stays up:
+
+        * the caller holds no live claim — a session that never leased this, or
+          an ``unknown`` caller facing only attributed claims (§5). Nothing is
+          written and nothing is logged, as for a ``down`` that found no lease.
+        * others still hold it — only the caller's claim is removed, and a
+          ``claim_released`` event (not a ``down``) records who still holds it.
+
+        A lease already being stopped is not held by anyone's claim: a holder's
+        release joins the recorded stop instead.
+        """
+        stopping = lease.stop is not None or state_of(lease) in (
+            State.STOPPING, State.CLEANUP_INCOMPLETE,
+        )
+        t.was_running = True
+        if caller not in live:
+            return self._row(
+                t, stopped=False, released=False, held_by=sorted(live),
+                detail="this session holds no claim on this environment; nothing was changed",
+            )
+        remaining = sorted(k for k in live if k != caller)
+        if not remaining or stopping:
+            return None
+        kept = lease.released(caller, now)
+        kept.write(t.path)
+        self.events.record(
+            ev.CLAIM_RELEASED, lease.project, op=ev.DOWN, reason=why, reason_source=source,
+            released_by=caller, held_by=remaining, port=lease.port, cwd=lease.cwd,
+            generation=lease.generation,
+        )
+        return self._row(
+            t, stopped=False, released=True, held_by=remaining,
+            state=state_of(kept).value, lease_expires=kept.expires.isoformat(),
+            detail=(
+                "released this session's claim; the environment keeps running for "
+                + ", ".join(remaining)
+            ),
+        )
 
     def _dispatch_recovery(
         self, targets: list[_StopTarget], why: str, source: str, deadline: float
@@ -1260,6 +1610,7 @@ class Service:
             "cwd": t.cwd,
             "port": t.port,
             "was_running": t.was_running,
+            **t.claim_fields,
             **fields,
         }
 
@@ -1351,7 +1702,11 @@ class Service:
         except DevctlError as e:  # pragma: no cover - reconcile swallows lease errors
             return e.to_envelope()
 
-    def env_sweep(self) -> dict[str, Any]:
+    def env_sweep(self, session: str | None = None) -> dict[str, Any]:
+        """Reconcile every lease. ``session`` is the caller's id when a hook
+        supplied one (ADR-0017 §2); no sweep decision depends on it — expiry is
+        per lease — so it is only echoed, which makes the identity a
+        SessionStart hook delivered visible in its output."""
         try:
             swept, kept = self._reconcile_all(op=ev.ACTOR_SWEEP)
             registry = self._safe_registry()
@@ -1360,6 +1715,8 @@ class Service:
                 "swept": swept,
                 "kept": [self._ls_entry(l) for l in kept],
             }
+            if session is not None:
+                result["session"] = session
             squatters, sq_unverified = self._squatters(registry, kept)
             if squatters:
                 if registry is not None and registry.enforcement == "strict":
@@ -1565,6 +1922,20 @@ class Service:
         except DevctlError:
             return None  # corrupt lease — skip (F5); the server shows up as a squatter
 
+    @staticmethod
+    def _claims_view(lease: Lease, now: datetime) -> list[dict[str, Any]]:
+        """The live claims as envelope rows, soonest to lapse first."""
+        live = sorted(lease.live_claims(now).items(), key=lambda kv: (kv[1].expires, kv[0]))
+        return [
+            {
+                "session": sid,
+                "via": c.via,
+                "since": None if c.since is None else c.since.isoformat(),
+                "expires": c.expires.isoformat(),
+            }
+            for sid, c in live
+        ]
+
     def _ls_entry(self, lease: Lease) -> dict[str, Any]:
         """One board row. Beyond 1.0.x's fields: ``state``, ``supervisor``,
         ``survivors`` and ``pending`` — what the lease says, so a row can never
@@ -1583,6 +1954,9 @@ class Service:
             "started": lease.created.isoformat(),
             "lease_expires": lease.expires.isoformat(),
             "state": state.value,
+            # Who is entitled to it (ADR-0017 §9). Two different ids here in one
+            # checkout is two sessions sharing it; `session` stays the starter.
+            "claims": self._claims_view(lease, self._now()),
             "supervisor": None if sup is None else {
                 "pid": sup.pid,
                 "registered": sup.registered,
@@ -1761,6 +2135,7 @@ class Service:
         readiness: Readiness = Readiness.NOT_PROBED,
         record: bool,
         detail: str | None = None,
+        caller: str | None = None,
     ) -> dict[str, Any]:
         """Render the ``env_up`` envelope — and, for a renewal, record the event.
 
@@ -1788,7 +2163,11 @@ class Service:
                 already_running=already_running,
                 generation=lease.generation,
                 supervisor_pid=sup_pid,
+                # Who this renewal was for; `session` stays the starter (ADR-0017 §1).
+                claimed_by=caller,
             )
+        now = self._now()
+        claims = self._claims_view(lease, now)
         out: dict[str, Any] = {
             "ok": True,
             "project": lease.project,
@@ -1804,7 +2183,14 @@ class Service:
             "already_running": already_running,
             "state": state_of(lease).value,
             "supervisor_pid": sup_pid,
+            # Every session entitled to this environment (ADR-0017 §9), so a
+            # caller can see it is sharing before it decides to stop anything.
+            "claims": claims,
         }
+        if caller is not None:
+            others = [c["session"] for c in claims if c["session"] != caller]
+            if others and already_running:
+                out["shared_with"] = others
         if lease.spawn_cwd is not None:
             # Which directory is actually being served. Named on every start,
             # not only on re-rooted ones: "you are being served the checkout you
@@ -1856,11 +2242,12 @@ class Service:
 
     @staticmethod
     def _caller_session() -> str:
-        """The session id to attribute a lease to (ADR-0011 §4).
+        """The session id to claim and attribute under (ADR-0011 §4, ADR-0017 §2).
 
-        Returns :data:`~rentctl.core.events.UNATTRIBUTED` when none of
-        :data:`SESSION_ID_ENVS` is set in this process's environment. That is a
-        statement about what rentctl could read and nothing more.
+        Env only: hook stdin is read by the CLI's hook-shaped commands, which
+        pass the id in. Returns :data:`~rentctl.core.events.UNATTRIBUTED` when
+        none of :data:`SESSION_ID_ENVS` is set in this process's environment.
+        That is a statement about what rentctl could read and nothing more.
 
         The previous wording here called it "the honest answer for a runtime that
         exposes no session identity." It was not honest, because it was not true:
@@ -1869,4 +2256,4 @@ class Service:
         than a missing field — every reader of the log was told the runtime had
         been asked and had nothing to say.
         """
-        return _first_env(SESSION_ID_ENVS) or ev.UNATTRIBUTED
+        return caller_session()

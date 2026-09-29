@@ -6,7 +6,66 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: semver. Patch and minor are derived from the impact of what shipped;
 a major is **declared** by a human rather than computed.
 
-## [1.1.0] — release-ready, not yet published
+## [1.2.0] — release-ready, not yet published
+
+**rentctl works in Codex as well as Claude Code, and it teaches the agent how to use it.**
+One plugin directory now installs into both clients: the MCP server, the cleanup hooks, and
+a shared `dev-environment` skill that turns "run this app", "show me my changes", "why won't
+it start" and "stop my environment" into the right rentctl calls. Sessions that share a
+checkout now share its environment instead of killing it under each other.
+
+### Added
+
+- **Codex support.** The plugin carries a Codex manifest (`plugin/.codex-plugin/plugin.json`)
+  beside the Claude Code one, and both clients install it from the same marketplace
+  (`codex plugin marketplace add Michael-Drake/rentctl`, `codex plugin add rentctl@rentctl`).
+  Codex runs the MCP server and the hooks outside its sandbox, on your machine; inside the
+  sandbox a shell `rent up` refuses with `UNSUPPORTED_ENVIRONMENT` rather than acting blind.
+  Codex asks you to trust a plugin's hooks once (`/hooks`); until you do, cleanup falls back
+  to lease expiry, and `rent doctor` says so.
+- **The `dev-environment` skill**, shared by both clients: find the project, reuse a running
+  environment, start or renew it, report the real URL and readiness, read the log before
+  retrying, and stop only this session's hold. It never approves a command on your behalf:
+  enrolling (`rent init`) and re-approving a changed command (`rent sync`) stay yours.
+- **`env_up` / `rent up` without a project name** use the one the checkout's `rentctl.toml`
+  declares. Outside any project the answer is `NOT_A_PROJECT`; a project that is declared but
+  not enrolled on this machine says exactly that (`UNKNOWN_PROJECT`, `enrolled: false`).
+- **MCP tool annotations**, so clients can tell what each tool does: `env_ls` is read-only,
+  `env_up`/`env_down` act only on rentctl's own leased workloads, `env_sweep` can be
+  destructive under strict enforcement.
+- **`rent doctor`** reports which session identity rentctl resolved, and — when Codex is
+  installed — whether the plugin is enabled, whether its hooks are trusted, and whether a
+  hand-written `[mcp_servers.rentctl]` shadows it.
+
+### Changed
+
+- **Sessions in one checkout share an environment through expiring claims.** Each session
+  that asks for an environment holds its own claim; a session ending releases only its own
+  claim, and the server stops when the last one goes. MCP `env_down` now *releases* by
+  default (`stopped: false`, `held_by: [...]` when others still hold it) and takes
+  `force: true` to stop it for everyone. `rent down` from a terminal is still a deliberate
+  stop, and names the claims it overrode. Previously the first session to end stopped the
+  server for every session in the checkout — including sessions that had never started it.
+- **The plugin's hooks moved to `plugin/hooks/hooks.json`** (the shape both clients load),
+  and the session-end command no longer depends on a Claude-only variable. Behaviour in
+  Claude Code is unchanged.
+- **An environment belongs to the checkout, not to the folder a session was started in.**
+  A session launched in `app/src` and one launched in `app` now share one server; before,
+  they drew two ports and ran two servers over the same files. Separate git worktrees
+  still get separate environments.
+
+### Fixed
+
+- **The SessionStart hook no longer prints `rent sweep`'s result.** Codex reads that output
+  as hook JSON and showed "Hook failed" at the start of every healthy session; Claude Code
+  passed it to the model as context. A failed sweep still reports on stderr.
+- **`rent doctor` reads the hooks your installed plugin actually wires**, in Claude Code and
+  in Codex, and compares them with the installed rentctl: a plugin whose SessionEnd hook
+  is missing or will not load is a failure, and one at a different version is a warning.
+  Before, a broken plugin hook passed every check while cleanup silently fell back to
+  expiry. `rent doctor` also honours `CLAUDE_CONFIG_DIR`.
+
+## [1.1.0] — 2026-09-29
 
 **rentctl now tracks the workload, not the launch process.** Every environment gets its
 own supervisor: a small rentctl process that starts the approved command inside a POSIX

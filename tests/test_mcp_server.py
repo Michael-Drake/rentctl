@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
-import pytest
-
+import json
 from datetime import datetime
+
+import anyio
+import pytest
+from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.types import RequestParams
 
 from fakesup import FakeSupervision
 from rentctl import mcp_server as m
+from rentctl.core import service as service_mod
 from rentctl.core.service import Service
 
 from conftest import CDT, Clock
@@ -143,3 +148,165 @@ def test_handshake_reports_rentctl_version_not_the_sdks(devctl_home):
     )
     reply = json.loads(p.stdout.splitlines()[0])
     assert reply["result"]["serverInfo"] == {"name": "rentctl", "version": __version__}
+
+
+# --- ADR-0018 §4/§5: annotations and per-call session identity over the protocol --
+
+
+def _over_the_protocol(body):
+    """Run ``body(client)`` against this module's server through a real MCP
+    client session (in-memory streams), so `tools/list` and `tools/call` —
+    `_meta` included — cross the protocol exactly as a client sends them."""
+
+    async def main():
+        async with create_connected_server_and_client_session(m.mcp) as client:
+            return await body(client)
+
+    return anyio.run(main)
+
+
+def _payload(result):
+    assert not result.isError, result
+    return json.loads(result.content[0].text)
+
+
+def test_tools_list_carries_honest_annotations():
+    """`codex exec` refuses a tool with no annotations; it passes one that is
+    read-only, or not destructive and closed-world. env_sweep stays behind an
+    approval because under strict enforcement it can reclaim a foreign port."""
+
+    async def body(client):
+        return {t.name: t.annotations for t in (await client.list_tools()).tools}
+
+    ann = _over_the_protocol(body)
+    assert ann["env_ls"].readOnlyHint is True and ann["env_ls"].openWorldHint is False
+    for name in ("env_up", "env_down"):
+        a = ann[name]
+        assert (a.readOnlyHint, a.destructiveHint, a.idempotentHint, a.openWorldHint) == (
+            False, False, True, False,
+        ), name
+    assert ann["env_sweep"].destructiveHint is True and ann["env_sweep"].openWorldHint is False
+    # Codex's no-approval rule passes every tool except env_sweep.
+    passes = {
+        n: bool(a.readOnlyHint) or (a.destructiveHint is False and a.openWorldHint is False)
+        for n, a in ann.items()
+    }
+    assert passes == {"env_ls": True, "env_up": True, "env_down": True, "env_sweep": False}
+
+
+def test_the_context_parameter_is_not_part_of_any_tool_schema():
+    for tool in m.mcp._tool_manager.list_tools():
+        assert "ctx" not in tool.parameters.get("properties", {}), tool.name
+
+
+@pytest.fixture
+def no_env_session(monkeypatch):
+    for name in service_mod.SESSION_ID_ENVS:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_a_codex_thread_id_in_meta_is_the_claim(mcp_service, no_env_session, devctl_home):
+    """Codex sends the session id per call in `_meta.threadId`, equal to the
+    SessionEnd hook's stdin `session_id` — so the claim must be recorded under
+    it, or the hook's release finds nothing of its session to release."""
+
+    async def up(client):
+        return await client.call_tool("env_up", {"project": "webapp"}, meta={"threadId": "T1"})
+
+    res = _payload(_over_the_protocol(up))
+    assert res["ok"] is True
+    assert [c["session"] for c in res["claims"]] == ["T1"]
+    (lease_file,) = list(devctl_home.leases_dir.glob("*.json"))
+    assert set(json.loads(lease_file.read_text())["claims"]) == {"T1"}
+
+    async def down(client):
+        return await client.call_tool("env_down", {"project": "webapp"}, meta={"threadId": "T1"})
+
+    out = _payload(_over_the_protocol(down))
+    assert out["ok"] is True and out["stopped"] is True
+
+
+def test_the_turn_metadata_session_id_is_the_fallback(mcp_service, no_env_session):
+    async def body(client):
+        return await client.call_tool(
+            "env_up", {"project": "webapp"},
+            meta={"x-codex-turn-metadata": {"session_id": "S2", "turn_id": "t"}},
+        )
+
+    res = _payload(_over_the_protocol(body))
+    assert [c["session"] for c in res["claims"]] == ["S2"]
+    m.env_down("webapp", force=True)
+
+
+def test_no_meta_falls_back_to_the_environment(mcp_service, monkeypatch, no_env_session):
+    """Claude Code sends no session in `_meta`; its id is in the server's env."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "cc-1")
+
+    async def body(client):
+        return await client.call_tool("env_up", {"project": "webapp"})
+
+    res = _payload(_over_the_protocol(body))
+    assert [c["session"] for c in res["claims"]] == ["cc-1"]
+    m.env_down("webapp", force=True)
+
+
+def test_another_threads_down_releases_only_its_own_claim(mcp_service, no_env_session):
+    """Two Codex threads in one checkout share one server process: each call's
+    `_meta` decides whose claim it is."""
+
+    async def body(client):
+        await client.call_tool("env_up", {"project": "webapp"}, meta={"threadId": "A"})
+        await client.call_tool("env_up", {"project": "webapp"}, meta={"threadId": "B"})
+        return await client.call_tool("env_down", {"project": "webapp"}, meta={"threadId": "A"})
+
+    out = _payload(_over_the_protocol(body))
+    assert out["ok"] is True and out["stopped"] is False
+    assert [e["project"] for e in m.env_ls()["environments"]] == ["webapp"]
+    m.env_down("webapp", force=True)
+
+
+def test_env_sweep_echoes_the_meta_session(mcp_service, no_env_session):
+    async def body(client):
+        return await client.call_tool("env_sweep", {}, meta={"threadId": "T9"})
+
+    res = _payload(_over_the_protocol(body))
+    assert res["ok"] is True and res["session"] == "T9"
+
+
+class _Req:
+    def __init__(self, meta):
+        self.meta = meta
+
+
+class _Ctx:
+    def __init__(self, meta=None, raises=False):
+        self._meta, self._raises = meta, raises
+
+    @property
+    def request_context(self):
+        if self._raises:
+            raise ValueError("Context is not available outside of a request")
+        return _Req(self._meta)
+
+
+@pytest.mark.parametrize(
+    ("ctx", "expected"),
+    [
+        (None, None),
+        (_Ctx(raises=True), None),
+        (_Ctx(None), None),
+        (_Ctx({"threadId": "T"}), "T"),
+        (_Ctx({"threadId": "T", "x-codex-turn-metadata": {"session_id": "S"}}), "T"),
+        (_Ctx({"x-codex-turn-metadata": {"session_id": "S"}}), "S"),
+        (_Ctx({"threadId": ""}), None),
+        (_Ctx({"threadId": 7}), None),
+        (_Ctx({"threadId": "bad\nid"}), None),
+        (_Ctx({"threadId": "x" * 300}), None),
+        (_Ctx({"x-codex-turn-metadata": "not an object"}), None),
+        (_Ctx(RequestParams.Meta(threadId="M")), "M"),
+        (_Ctx(RequestParams.Meta(progressToken=1)), None),
+        (_Ctx(object()), None),
+    ],
+)
+def test_meta_session_reads_every_shape_and_never_raises(ctx, expected):
+    assert m.meta_session(ctx) == expected

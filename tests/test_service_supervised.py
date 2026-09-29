@@ -109,15 +109,24 @@ class Env:
         rows = EventLog(self.paths.events_file).read()
         return [r for r in rows if kind is None or r["event"] == kind]
 
-    def cli(self, *argv: str, timeout: float = 30.0) -> tuple[subprocess.CompletedProcess, float]:
+    def cli(
+        self, *argv: str, timeout: float = 30.0, stdin: str | None = None,
+        session_env: dict[str, str] | None = None,
+    ) -> tuple[subprocess.CompletedProcess, float]:
+        """Run the real CLI. ``stdin`` is what a hook would pipe it (ADR-0017 §2);
+        without it stdin is empty. The session variables of whatever session runs
+        this suite are stripped, so identity is only what the test hands over."""
         env = {
-            **os.environ,
-            "RENTCTL_STATE_HOME": str(self.paths.state_home),
-            "RENTCTL_CONFIG_HOME": str(self.paths.config_home),
+            k: v for k, v in os.environ.items() if k not in service_mod.SESSION_ID_ENVS
         }
+        env.update(
+            RENTCTL_STATE_HOME=str(self.paths.state_home),
+            RENTCTL_CONFIG_HOME=str(self.paths.config_home),
+            **(session_env or {}),
+        )
         t0 = time.monotonic()
         proc = subprocess.run([PY, "-m", "rentctl.cli", *argv], capture_output=True, text=True,
-                              env=env, timeout=timeout)
+                              env=env, timeout=timeout, input=stdin or "")
         return proc, time.monotonic() - t0
 
     def track(self, ref: SupervisorRef | None) -> None:
@@ -535,7 +544,8 @@ def test_session_end_down_all_returns_within_budget(env):
         env.ignoring(res["port"])
         leases.append(env.lease(name))
 
-    proc, elapsed = env.cli("down", "--all", "--cwd", str(env.cwd), "--reason", "session-end")
+    proc, elapsed = env.cli("down", "--all", "--cwd", str(env.cwd), "--reason", "session-end",
+                            stdin=json.dumps({"session_id": "itest"}))
     print(f"\nS5 hook return time: {elapsed * 1000:.0f} ms")
     assert proc.returncode == 0, proc.stderr
     assert elapsed < 1.5, f"the hook took {elapsed:.2f}s"
@@ -569,7 +579,8 @@ def test_session_end_hands_a_legacy_lease_to_a_detached_recovery_supervisor(env)
         expires=_now_local() + timedelta(hours=1), log=str(env.tmp / "legacy.log"),
     ).write(path)
 
-    proc, elapsed = env.cli("down", "--all", "--cwd", str(env.cwd), "--reason", "session-end")
+    proc, elapsed = env.cli("down", "--all", "--cwd", str(env.cwd), "--reason", "session-end",
+                            stdin=json.dumps({"session_id": "old"}))
     assert proc.returncode == 0, proc.stderr
     assert elapsed < 1.5, elapsed
     (row,) = json.loads(proc.stdout)["downed"]
@@ -585,6 +596,60 @@ def test_session_end_hands_a_legacy_lease_to_a_detached_recovery_supervisor(env)
 
 
 # --- migration (§14) --------------------------------------------------------------------
+
+# --- ADR-0017: two sessions, one checkout, the real CLI end to end ----------------------
+
+def test_e2e_session_end_releases_and_only_the_last_release_stops(env):
+    """Session A starts the server, session B shares it, each through the real
+    `rent up`. A's real SessionEnd hook command (stdin id A) leaves B's server
+    serving; B's then stops it and the port stops answering. Both hooks return
+    inside the 1.5 s budget."""
+    env.enroll("demo", env.server_cmd())
+
+    proc, _ = env.cli("up", "demo", "--cwd", str(env.cwd),
+                      session_env={"CLAUDE_CODE_SESSION_ID": "A"})
+    assert proc.returncode == 0, proc.stderr
+    up_a = json.loads(proc.stdout)
+    env.track(env.lease("demo").supervisor)
+    port = up_a["port"]
+    assert up_a["already_running"] is False and answers(port)
+
+    proc, _ = env.cli("up", "demo", "--cwd", str(env.cwd),
+                      session_env={"CLAUDE_CODE_SESSION_ID": "B"})
+    assert proc.returncode == 0, proc.stderr
+    up_b = json.loads(proc.stdout)
+    assert up_b["already_running"] is True and up_b["port"] == port
+    assert up_b["shared_with"] == ["A"]
+    assert set(env.lease("demo").claims) == {"A", "B"}
+
+    # A's hook. The env names a different session on purpose: the hook's
+    # contract channel is stdin, and it must win.
+    proc, elapsed = env.cli("down", "--all", "--cwd", str(env.cwd), "--reason", "session-end",
+                            stdin=json.dumps({"session_id": "A", "reason": "logout"}),
+                            session_env={"CLAUDE_CODE_SESSION_ID": "not-A"})
+    assert proc.returncode == 0, proc.stderr
+    assert elapsed < 1.5, elapsed
+    (row,) = json.loads(proc.stdout)["downed"]
+    assert row["stopped"] is False and row["released"] is True and row["held_by"] == ["B"]
+    time.sleep(1.5)  # a supervisor that had been asked to stop would be well into it
+    lease = env.lease("demo")
+    assert lease is not None and lease.state == "running" and lease.stop is None
+    assert answers(port)
+    assert env.events("down") == []
+
+    proc, elapsed = env.cli("down", "--all", "--cwd", str(env.cwd), "--reason", "session-end",
+                            stdin=json.dumps({"session_id": "B"}))
+    assert proc.returncode == 0, proc.stderr
+    assert elapsed < 1.5, elapsed
+    (row,) = json.loads(proc.stdout)["downed"]
+    assert row["released_by"] == "B"
+    assert wait_until(lambda: env.lease("demo") is None, 20)
+    assert wait_until(lambda: not answers(port), 10)
+    assert env.members(lease) == []
+    (down,) = env.events("down")
+    assert down["reason"] == "session-end" and down["layer"] == 2
+    assert down["killed"] is True and down["released_by"] == "B"
+
 
 def test_legacy_lease_stop_uses_session_membership(env):
     """S1's shape on a 1.0.x lease: the leader shell exits, a SIGTERM-ignoring

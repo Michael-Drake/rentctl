@@ -95,6 +95,13 @@ CLEANUP_INCOMPLETE = "cleanup_incomplete"
 # A reconciler found a registered supervisor dead.
 SUPERVISOR_LOST = "supervisor_lost"
 
+# A session released its claim on a shared environment and other claims kept it
+# running (ADR-0017 §4, §9). NOT a teardown: nothing was stopped, so it is not a
+# ``down`` and moves no layer count. It carries ``released_by`` and ``held_by``.
+# A release that stops the environment is the ``down`` itself, with
+# ``released_by``; a release by a session holding no claim is not recorded.
+CLAIM_RELEASED = "claim_released"
+
 # New teardown reasons. None of them maps to a cleanup layer, deliberately:
 # they are not in LAYER_BY_REASON, so the pilot's ``layers`` block ignores them.
 LEASE_LOST = "lease-lost"                        # a supervisor found its lease gone or replaced
