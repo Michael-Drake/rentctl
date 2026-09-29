@@ -43,6 +43,8 @@ from rentctl.core.paths import DevctlPaths, lease_key, project_from_key
 from rentctl.core.supervision import self_ref, supervisor_argv, wake_supervisor
 
 PY = sys.executable
+# `python -m http.server`'s replacement; see loopserve.py for why.
+LOOPSERVE = str(Path(__file__).resolve().parent / "loopserve.py")
 PROJECT = "suptest"
 
 # A loopback HTTP server with a 60 s lifetime cap (the leak bound). Writes its
@@ -50,13 +52,14 @@ PROJECT = "suptest"
 # shortens the cap (a server that exits on its own).
 SERVER = """\
 import http.server, os, signal, sys, threading, time
+from loopserve import LoopbackHTTPServer
 if "--ignore-term" in sys.argv:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 life = 60.0
 if "--life" in sys.argv:
     life = float(sys.argv[sys.argv.index("--life") + 1])
-srv = http.server.ThreadingHTTPServer(("127.0.0.1", int(os.environ["PORT"])),
-                                      http.server.SimpleHTTPRequestHandler)
+srv = LoopbackHTTPServer(("127.0.0.1", int(os.environ["PORT"])),
+                         http.server.SimpleHTTPRequestHandler)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 tmp = sys.argv[1] + ".tmp"
 open(tmp, "w").write(str(os.getpid()))
@@ -94,13 +97,14 @@ time.sleep(60)
 # Double-fork + setsid, then serve: the daemonizer the macOS guarantee excludes (§5).
 DAEMON = """\
 import http.server, os, sys, threading, time
+from loopserve import LoopbackHTTPServer
 if os.fork():
     os._exit(0)
 os.setsid()
 if os.fork():
     os._exit(0)
-srv = http.server.ThreadingHTTPServer(("127.0.0.1", int(os.environ["PORT"])),
-                                      http.server.SimpleHTTPRequestHandler)
+srv = LoopbackHTTPServer(("127.0.0.1", int(os.environ["PORT"])),
+                         http.server.SimpleHTTPRequestHandler)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 tmp = sys.argv[1] + ".tmp"
 open(tmp, "w").write(str(os.getpid()))

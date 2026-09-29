@@ -32,6 +32,7 @@ from rentctl.core.reconcile import Action, decide
 from rentctl.core.registry import RegistryProfile
 from rentctl.core.runners import ProcessRunner
 from rentctl.core.service import _now_local
+from suphelp import LOOPSERVE
 
 pytestmark = pytest.mark.integration
 
@@ -253,7 +254,7 @@ def test_runner_normal_server_and_children_stop(tmp_path):
     h = start(
         r,
         tmp_path,
-        f"'{PY}' -m http.server \"$PORT\" --bind 127.0.0.1 & "
+        f"'{PY}' '{LOOPSERVE}' \"$PORT\" & "
         f"'{PY}' '{plain}' '{tmp_path}/child.pid' & wait",
         port=port,
     )

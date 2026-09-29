@@ -28,6 +28,7 @@ from rentctl.core.paths import lease_key
 from rentctl.core.registry import BLOCK_SIZE, RegistryProfile
 from rentctl.core.runners import ProcessRunner
 from rentctl.core.service import Service, _now_local
+from suphelp import LOOPSERVE
 
 pytestmark = pytest.mark.integration
 
@@ -87,7 +88,7 @@ def fast_runner(name):
 def integ(devctl_home, write_registry, tmp_path):
     """A real Service over an http.server profile on a free port block."""
     port = free_block()
-    cmd = f'{sys.executable} -m http.server "$PORT" --bind 127.0.0.1'
+    cmd = f"'{sys.executable}' '{LOOPSERVE}' \"$PORT\""
     write_registry(
         {
             "projects": {
@@ -108,10 +109,12 @@ def integ(devctl_home, write_registry, tmp_path):
         # Deliberately ABOVE the product default of 30s, not below it. At 10s
         # this fixture was stricter than anything rentctl ships, and it failed
         # nine integration tests on GitHub's macOS runners -- not from a bug,
-        # but because `python -m http.server` could not finish booting in time
-        # on a host that needs ~2.2s to start Python for a one-line script.
+        # but because `python -m http.server` could not finish booting in time.
         # The evidence was START_TIMEOUT with an EMPTY log_tail and a process
-        # still alive: nothing had crashed, it simply had not bound yet.
+        # still alive: nothing had crashed, it simply was not listening yet.
+        # That was put down to ~2.2s of Python startup; measured in 1.1.0 it is
+        # 0.02s, and the real cost is a ~35s reverse-DNS lookup between bind and
+        # listen (tests/loopserve.py), which the workload no longer makes.
         # No test asserts on the timeout path, so the only cost of a generous
         # value is wall-clock on a genuine failure.
         readiness_timeout=60.0,
@@ -415,7 +418,7 @@ def test_orphaned_server_reported_and_strict_reclaims(integ, write_registry, tmp
     assert any(s["port"] == integ.port for s in squatters)
 
     # A strict-enforcement service reclaims the block port.
-    cmd = f'{sys.executable} -m http.server "$PORT" --bind 127.0.0.1'
+    cmd = f"'{sys.executable}' '{LOOPSERVE}' \"$PORT\""
     write_registry(
         {
             "enforcement": "strict",

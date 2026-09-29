@@ -20,8 +20,11 @@ import pytest
 # child through the environment too — otherwise a bare checkout (the merge gate's
 # throwaway worktree, ADR-0058 D4) imports devctl here but not in the subprocess.
 _SRC = str(Path(__file__).resolve().parent.parent / "src")
+# tests/ too, so a spawned script can `from loopserve import LoopbackHTTPServer`
+# instead of restating the one test server (see tests/loopserve.py for why).
+_TESTS = str(Path(__file__).resolve().parent)
 os.environ["PYTHONPATH"] = os.pathsep.join(
-    [_SRC, *(p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p)]
+    [_SRC, _TESTS, *(p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p)]
 )
 
 from rentctl.core import procutil, supervision  # noqa: E402

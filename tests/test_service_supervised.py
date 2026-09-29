@@ -35,6 +35,7 @@ from rentctl.core.runners import ProcessRunner
 from rentctl.core.service import Service, _now_local
 from suphelp import (
     DECOY,
+    LOOPSERVE,
     PLAIN,
     PROJECT,
     PY,
@@ -376,7 +377,7 @@ def test_foreign_listener_never_killed(env, tmp_path):
     touching it; the board reports it as a squatter and nothing kills it."""
     block = env.enroll("demo", env.server_cmd())
     slow_block = env.enroll("slow", "sleep 30")
-    foreign_cmd = [PY, "-m", "http.server", "--bind", "127.0.0.1"]
+    foreign_cmd = [PY, LOOPSERVE]
     foreign = subprocess.Popen([*foreign_cmd, str(block)], cwd=tmp_path,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     foreign2 = None
