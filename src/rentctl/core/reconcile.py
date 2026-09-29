@@ -14,6 +14,13 @@ Three outcomes per lease:
 * ``KEEP``   — same process alive and lease not past its deadline.
 * ``EXPIRE`` — same process alive but ``now >= expires`` → stop it, remove lease.
 * ``CLEAN``  — process gone or PID recycled → just remove the lease; nothing to kill.
+
+ADR-0016 §10's extended table (supervisor liveness, session membership,
+``unsupervised``, ``identity_ambiguous``, recovery claims) is
+``lifecycle.decide``, and since plan step 7 the service reconciles every lease
+through it — legacy ones included, read as ``unsupervised``. This three-way
+decision is kept for the one caller it still fits: a 1.0.x-era watchdog
+babysitting a legacy lease with the fixed runner (§14).
 """
 
 from __future__ import annotations

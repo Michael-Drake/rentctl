@@ -11,7 +11,7 @@ Run just these with ``-m integration``; skip them with ``-m 'not integration'``.
 from __future__ import annotations
 
 import os
-import signal
+import random
 import socket
 import subprocess
 import sys
@@ -24,7 +24,6 @@ import pytest
 
 from rentctl.core import procutil
 from rentctl.core.leases import Lease
-from rentctl.core.models import ProcessHandle
 from rentctl.core.paths import lease_key
 from rentctl.core.registry import BLOCK_SIZE, RegistryProfile
 from rentctl.core.runners import ProcessRunner
@@ -51,13 +50,11 @@ def free_block(size: int = BLOCK_SIZE) -> int:
     only tests have to go looking for one.
     """
     for _ in range(50):
-        base = free_port()
-        # An ephemeral port in the top `size` would make base+offset exceed
-        # 65535, and that raises OverflowError — NOT OSError — so it escaped the
-        # retry below and failed the run outright. Rare, load-dependent, and
-        # therefore exactly the kind of flake that gets re-run rather than fixed.
-        if base + size - 1 > 65535:
-            continue
+        # Drawn below the ephemeral ranges, for the reason `suphelp.free_block`
+        # gives: a block found empty among the ports the kernel hands to every
+        # outgoing connection did not stay empty under load. (That also retires
+        # the old overflow guard — no base here comes near 65535.)
+        base = random.randrange(20000, 32000 - size)
         socks = []
         try:
             for offset in range(size):
@@ -104,7 +101,10 @@ def integ(devctl_home, write_registry, tmp_path):
     )
     svc = Service(
         devctl_home,
-        runner_factory=fast_runner,
+        # The grace periods ride in the lease plan to the supervisor (ADR-0016
+        # §6), and bound an in-process recovery stop.
+        term_grace_s=3.0,
+        kill_grace_s=2.0,
         # Deliberately ABOVE the product default of 30s, not below it. At 10s
         # this fixture was stricter than anything rentctl ships, and it failed
         # nine integration tests on GitHub's macOS runners -- not from a bug,
@@ -115,7 +115,6 @@ def integ(devctl_home, write_registry, tmp_path):
         # No test asserts on the timeout path, so the only cost of a generous
         # value is wall-clock on a genuine failure.
         readiness_timeout=60.0,
-        watchdog_spawn=lambda p: None,  # tests that need a real watchdog spawn their own
         session_id_fn=lambda: "itest",
     )
     # A fixed cwd, so the lease key is deterministic across calls (ADR-0007).
@@ -125,24 +124,49 @@ def integ(devctl_home, write_registry, tmp_path):
         port=port,
         paths=devctl_home,
         project="demo",
+        cmd=cmd,
         tmp=tmp_path,
         cwd=cwd,
         key=lease_key("demo", cwd),
         lease=devctl_home.lease_file_for("demo", cwd),
     )
     yield ctx
-    # Teardown: down every instance, then hard-kill anything left in the block.
+    # Teardown: down every instance. Anything that outlives it is caught — and
+    # failed — by the `workload_sessions` guard, which tracks every supervisor
+    # and every runner-started workload; nothing here signals by port.
     try:
         svc.env_down("demo", all_instances=True)
     except Exception:
         pass
-    for p in range(port, port + BLOCK_SIZE):
-        owner = procutil.port_owner(p)
-        if owner is not None:
-            try:
-                os.killpg(os.getpgid(owner.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
+
+
+def legacy_env(integ, *, expires_in: timedelta = timedelta(minutes=30), poison: float = 0.0):
+    """A 1.0.x environment: a runner-started server and a lease in 1.0.x's shape.
+
+    The runner is what 1.0.x spawned with (its own session), so the handle maps
+    to that session exactly as §2 describes. ``poison`` skews the recorded
+    start time, which is what a recycled pid looks like from the lease's side.
+    """
+    runner = fast_runner("process")
+    prof = RegistryProfile(cmd=integ.cmd, cwd=str(integ.tmp), port_env="PORT", preferred_offset=0)
+    handle = runner.start(prof, integ.port, integ.tmp / "legacy.log")
+    assert wait_until(lambda: _answers(integ.port), timeout=30)
+    lease = Lease(
+        project="demo", profile="default", runner="process",
+        handle={"pid": handle.pid, "pid_start_time": handle.pid_start_time + poison},
+        port=integ.port, session="old", cwd=integ.cwd, created=_now_local(),
+        expires=_now_local() + expires_in, log=str(integ.tmp / "legacy.log"),
+    )
+    lease.write(integ.lease)
+    return handle, lease
+
+
+def _answers(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
 
 
 # --- up / down / idempotency (spec §10 items 1-2) -------------------------
@@ -159,6 +183,9 @@ def test_up_creates_answering_env(integ):
     assert res["already_running"] is False
     lease = Lease.read(integ.lease)
     assert procutil.is_alive(lease.process_handle())
+    # Owned by a registered supervisor whose session the server was born in.
+    assert lease.state == "running" and lease.supervisor.registered
+    assert os.getsid(lease.process_handle().pid) == lease.supervisor.pid
     # The port actually answers HTTP.
     with socket.create_connection(("127.0.0.1", integ.port), timeout=2):
         pass
@@ -172,7 +199,8 @@ def test_down_kills_and_is_idempotent(integ):
     handle = Lease.read(integ.lease).process_handle()
     res = integ.svc.env_down("demo", cwd=integ.cwd)
     assert res["was_running"] is True
-    assert wait_until(lambda: not procutil.is_alive(handle))
+    assert res["stopped"] is True  # read from the lease the supervisor removed
+    assert not procutil.is_alive(handle)
     assert not integ.lease.exists()
     # Down again → idempotent success, not an error.
     again = integ.svc.env_down("demo", cwd=integ.cwd)
@@ -285,8 +313,10 @@ def test_two_worktrees_run_side_by_side(integ, tmp_path):
     handle_a = Lease.read(integ.paths.lease_file_for("demo", str(lane_a))).process_handle()
     handle_b = Lease.read(integ.paths.lease_file_for("demo", str(lane_b))).process_handle()
 
-    # Lane A's session end must not touch lane B.
-    integ.svc.env_down(cwd=str(lane_a), reason="session-end")
+    # Lane A's session end must not touch lane B. The hook returns `pending`
+    # at once (R0); lane A's supervisor completes the stop on its own.
+    res = integ.svc.env_down(cwd=str(lane_a), reason="session-end")
+    assert [d["pending"] for d in res["downed"]] == [True]
     assert wait_until(lambda: not procutil.is_alive(handle_a))
     assert procutil.is_alive(handle_b) is True
     with socket.create_connection(("127.0.0.1", b["port"]), timeout=2):
@@ -294,7 +324,7 @@ def test_two_worktrees_run_side_by_side(integ, tmp_path):
 
     integ.svc.env_down(cwd=str(lane_b), reason="session-end")
     assert wait_until(lambda: not procutil.is_alive(handle_b))
-    assert integ.paths.project_lease_files("demo") == []
+    assert wait_until(lambda: integ.paths.project_lease_files("demo") == [])
 
 
 def test_concurrent_up_from_distinct_cwds_draws_distinct_ports(integ, tmp_path):
@@ -326,37 +356,58 @@ def test_concurrent_up_from_distinct_cwds_draws_distinct_ports(integ, tmp_path):
 # --- PID-recycle refusal (charter-named, spec §10 item 8) -----------------
 
 def test_down_refuses_recycled_pid(integ):
-    """A lease whose PID is alive but start-time is wrong must not be killed."""
-    integ.svc.env_up("demo", cwd=integ.cwd)
-    lease = Lease.read(integ.lease)
-    real_handle = lease.process_handle()
+    """A lease whose PID is alive but start-time is wrong must not be killed.
 
-    # Rewrite the lease with the same PID but a bogus start time (simulates the
-    # real process having exited and its PID recycled by something unrelated).
-    poisoned = ProcessHandle(pid=real_handle.pid, pid_start_time=real_handle.pid_start_time + 9999)
-    lease_bad = Lease(
-        **{**lease.__dict__, "handle": poisoned.to_dict()}
-    )
-    lease_bad.write(integ.lease)
+    A 1.0.x lease: its handle *is* the session's owner (§2). A schema-2 lease
+    names its session by the supervisor instead, which the next test covers.
+    """
+    # The lease records a bogus start time for a live pid (the real process
+    # exited and its pid was recycled by something unrelated, as the lease sees it).
+    real_handle, _ = legacy_env(integ, poison=9999.0)
+    before = integ.lease.read_bytes()
 
     res = integ.svc.env_down("demo", cwd=integ.cwd)
-    assert res["was_running"] is False           # alive(poisoned) is False → refused
-    assert procutil.is_alive(real_handle) is True  # the real server was NOT killed
-    assert not integ.lease.exists()  # but the stale lease was cleaned
+    # PID S is held by a process whose start time is not the lease's owner, and
+    # session S has members: the number may have been reused, so NOTHING under
+    # it can be proved ours (ADR-0016 §2). Refuse, keep the lease, surface it.
+    # 1.0.x deleted the lease here — correct only while `alive` looked at the
+    # leader alone; now the session is what is judged, and it is not empty.
+    assert res["stopped"] is False
+    assert res["identity_ambiguous"] is True
+    assert procutil.is_alive(real_handle) is True  # the real server was NOT signalled
+    assert integ.lease.read_bytes() == before      # not even a stop request
+    incomplete = [e for e in integ.svc.events.read() if e["event"] == "cleanup_incomplete"]
+    assert incomplete and incomplete[-1]["identity_ambiguous"] is True
 
     # Real cleanup via the true handle.
-    ProcessRunner(term_grace_s=3, kill_grace_s=2).stop(real_handle)
-    assert wait_until(lambda: not procutil.is_alive(real_handle))
+    outcome = ProcessRunner(term_grace_s=3, kill_grace_s=2).stop(real_handle)
+    assert outcome.verified
+    assert not procutil.is_alive(real_handle)
+    integ.lease.unlink()
 
 
-# --- squatter: delete lease, server survives (spec §10 item 5) ------------
-
-def test_orphaned_server_reported_and_strict_reclaims(integ, write_registry, tmp_path):
+def test_down_never_signals_through_a_supervised_leases_leader_pid(integ):
+    """On a schema-2 lease the leader's `pid_start_time` names nothing: the
+    session is the supervisor's. Skewing it changes neither who is stopped nor
+    how — the stop request goes to the supervisor, which stops its own session."""
     integ.svc.env_up("demo", cwd=integ.cwd)
     lease = Lease.read(integ.lease)
-    real_handle = lease.process_handle()
+    skewed = dict(lease.handle, pid_start_time=lease.handle["pid_start_time"] + 9999)
+    replace_lease = Lease(**{**lease.__dict__, "handle": skewed})
+    replace_lease.write(integ.lease)
+    res = integ.svc.env_down("demo", cwd=integ.cwd)
+    assert res["stopped"] is True
+    down = [e for e in integ.svc.events.read() if e["event"] == "down"][-1]
+    assert down["actor"] == "supervisor"
 
-    # Delete the lease but leave the server running → it becomes a squatter.
+
+# --- squatter: a server with no lease (spec §10 item 5) --------------------
+
+def test_orphaned_server_reported_and_strict_reclaims(integ, write_registry, tmp_path):
+    """A leaseless server on the block. Deleting a supervised lease no longer
+    makes one — its supervisor reads that as `lease-lost` and stops its own
+    session — so the orphan here is started directly, as a 1.0.x one was."""
+    real_handle, _ = legacy_env(integ)
     integ.lease.unlink()
 
     ls = integ.svc.env_ls()
@@ -377,18 +428,30 @@ def test_orphaned_server_reported_and_strict_reclaims(integ, write_registry, tmp
             },
         }
     )
-    strict = Service(integ.paths, runner_factory=fast_runner, watchdog_spawn=lambda p: None)
+    # The probe is confined to the one port this test's own orphan holds: the
+    # block is only free when drawn, other suites on this machine draw from the
+    # same ephemeral range, and strict mode SIGTERMs whatever squats a block —
+    # so an unconfined strict sweep here could signal a stranger's server.
+    strict = Service(
+        integ.paths,
+        port_owner_fn=lambda port: procutil.port_owner(port) if port == integ.port else None,
+    )
+    ours = procutil.port_owner(integ.port)
+    assert ours is not None and os.getsid(ours.pid) == real_handle.pid
     res = strict.env_sweep()
-    assert "killed_squatters" in res
+    # ADR-0016 §11: re-decided under L, then one verified SIGTERM — to our orphan.
+    (row,) = res["killed_squatters"]
+    assert row["port"] == integ.port and row["pid"] == ours.pid
+    assert row["killed"] is True and row["outcome"] == "signalled", row
     assert wait_until(lambda: not procutil.is_alive(real_handle))
 
 
 # --- watchdog expiry kill (spec §10 item 3) -------------------------------
+# 1.1 never spawns a watchdog, but a 1.0.x one may still babysit a legacy lease
+# after an upgrade (§14). It keeps working on the fixed runner.
 
 def test_real_watchdog_kills_on_expiry(integ):
-    integ.svc.env_up("demo", cwd=integ.cwd)
-    lease = Lease.read(integ.lease)
-    real_handle = lease.process_handle()
+    real_handle, lease = legacy_env(integ)
 
     # Shorten the lease to ~2s from now, then let a real watchdog notice.
     soon = _now_local() + timedelta(seconds=2)
@@ -411,10 +474,21 @@ def test_real_watchdog_kills_on_expiry(integ):
 
 # --- watchdog dies → sweep backstop (spec §10 item 4) ---------------------
 
-def test_sweep_backstops_dead_watchdog(integ):
+def test_real_watchdog_exits_on_a_supervised_lease(integ):
+    """§14: a watchdog that finds a schema-2 lease under its key exits at once
+    and touches nothing — the supervisor owns it."""
     integ.svc.env_up("demo", cwd=integ.cwd)
-    lease = Lease.read(integ.lease)
-    real_handle = lease.process_handle()
+    before = integ.lease.read_bytes()
+    wd = subprocess.run(
+        [sys.executable, "-m", "rentctl.watchdog", integ.key, "--interval", "0.3"],
+        env={**os.environ}, capture_output=True, text=True, timeout=30,
+    )
+    assert wd.stdout.strip() == "exit-lease-supervised"
+    assert integ.lease.read_bytes() == before
+
+
+def test_sweep_backstops_dead_watchdog(integ):
+    real_handle, lease = legacy_env(integ)
 
     # Spawn a real (slow-tick) watchdog, then kill it — simulating a dead babysitter.
     wd = subprocess.Popen(

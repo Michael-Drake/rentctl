@@ -1,8 +1,15 @@
-"""Service-layer tests: the four operations' decision logic, driven with a
-FakeRunner + controllable clock so every branch is fast and deterministic.
+"""Service-layer tests: the four operations' decision logic, driven through the
+fake supervision seam (``fakesup.FakeSupervision``) and a controllable clock so
+every branch is fast and deterministic.
 
-Real-process end-to-end behavior (process-group kill, concurrency, PID-recycle
-refusal against a live server) lives in test_integration.py.
+Since ADR-0016 the service starts and stops nothing itself: it writes lease
+transitions, spawns and wakes supervisors, and waits — holding no lock — for
+the outcome they write. The fake supervisors run the REAL lifecycle over a fake
+process table; no real process is scanned or signalled here except the
+disposable watchdog stand-ins in the WI-0069 section.
+
+Real-process end-to-end behaviour lives in test_integration.py and
+test_service_supervised.py.
 """
 
 from __future__ import annotations
@@ -12,64 +19,37 @@ import shutil
 import signal
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import psutil
 import pytest
 
-from rentctl.core import procutil
+from fakesup import FakeSupervision
+from rentctl.core import lifecycle, procutil, supervision
 from rentctl.core import service as service_mod
 from rentctl.core.errors import (
     BLOCK_EXHAUSTED,
+    CLEANUP_INCOMPLETE,
     CWD_ESCAPES_ROOT,
     INVALID_CWD,
     PROFILE_MISMATCH,
     REGISTRY_INVALID,
     START_TIMEOUT,
+    STATE_WRITE_FAILED,
+    STOP_IN_PROGRESS,
+    SUPERVISOR_START_FAILED,
     UNKNOWN_PROJECT,
+    DevctlError,
 )
-from rentctl.core.leases import Lease
-from rentctl.core.models import ProcessHandle, ProcInfo, Readiness
+from rentctl.core.leases import Lease, SupervisorRef
+from rentctl.core.lifecycle import Actor, ActorKind, Event, EventKind, new_starting_lease, transition
+from rentctl.core.models import ProcInfo, Readiness
 from rentctl.core.paths import lease_key
 from rentctl.core.service import Service
 
 CDT = timezone(timedelta(hours=-5))
-
-
-class FakeRunner:
-    """Deterministic stand-in for the process runner. start_time == pid, so a
-    handle with a mismatched start_time reads as recycled/dead."""
-
-    name = "process"
-
-    def __init__(self) -> None:
-        self.started: list[int] = []
-        self.stopped: list[int] = []
-        # The directory each start was handed (ADR-0010). Without this a fake
-        # runner agrees with a service that spawns in entirely the wrong place.
-        self.start_cwds: list[str] = []
-        self._alive: dict[int, bool] = {}
-        self._next_pid = 1000
-
-    def start(self, entry, port, log_path):
-        pid = self._next_pid
-        self._next_pid += 1
-        self._alive[pid] = True
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(f"started {entry.cmd} on {port}\nline2\n")
-        self.started.append(pid)
-        self.start_cwds.append(entry.cwd)
-        return ProcessHandle(pid=pid, pid_start_time=float(pid))
-
-    def stop(self, handle):
-        self.stopped.append(handle.pid)
-        self._alive[handle.pid] = False
-
-    def alive(self, handle):
-        return self._alive.get(handle.pid, False) and handle.pid_start_time == float(handle.pid)
-
-    def orphans(self):
-        return []
 
 
 class Clock:
@@ -84,17 +64,24 @@ class Clock:
 
 
 @pytest.fixture
-def fake_runner():
-    return FakeRunner()
-
-
-@pytest.fixture
 def clock():
     return Clock(datetime(2026, 7, 14, 8, 0, tzinfo=CDT))
 
 
 @pytest.fixture
-def service(devctl_home, write_registry, sample_registry_data, fake_runner, clock, monkeypatch):
+def world(devctl_home, clock):
+    return FakeSupervision(devctl_home, clock)
+
+
+def make_service(paths, world, clock, **kw) -> Service:
+    kw.setdefault("session_id_fn", lambda: "sess-1")
+    return Service(
+        paths, now_fn=clock, supervision=world, term_grace_s=0.05, kill_grace_s=0.05, **kw
+    )
+
+
+@pytest.fixture
+def service(devctl_home, write_registry, sample_registry_data, world, clock, monkeypatch):
     write_registry(sample_registry_data)
 
     # Nobody is listening, unless a test says otherwise.
@@ -113,43 +100,75 @@ def service(devctl_home, write_registry, sample_registry_data, fake_runner, cloc
 
     # …and nothing answers a socket either. `env_ls`'s `healthy` opens a real
     # connection, which is a second machine dependency on a different path: with
-    # webapp's dev server live on 5180, a fake runner's environment reported
-    # itself healthy because *something else* answered.
+    # webapp's dev server live on 5180, a fake environment reported itself
+    # healthy because *something else* answered.
     monkeypatch.setattr(service_mod, "_port_answering", lambda port: False)
-
-    spawned: list[str] = []
-
-    def watchdog_spawn(project):
-        spawned.append(project)
-        return 424242
-
-    svc = Service(
-        devctl_home,
-        now_fn=clock,
-        runner_factory=lambda name: fake_runner,
-        readiness_fn=lambda port, timeout, pgid: Readiness.ANSWERED,
-        watchdog_spawn=watchdog_spawn,
-        session_id_fn=lambda: "sess-1",
-    )
-    svc._spawned = spawned  # type: ignore[attr-defined]
-    return svc
+    return make_service(devctl_home, world, clock)
 
 
-# --- env_up ---------------------------------------------------------------
+def lease_at(paths, cwd, project="webapp") -> Lease | None:
+    return Lease.read_if_exists(paths.lease_file_for(project, cwd))
 
-def test_up_fresh(service, devctl_home, fake_runner):
+
+def events(service):
+    return service.events.read()
+
+
+def kinds(service) -> list[str]:
+    return [e["event"] for e in events(service)]
+
+
+# --- env_up: the §6 protocol ------------------------------------------------
+
+def test_up_fresh(service, devctl_home, world):
     res = service.env_up("webapp", cwd="/proj/webapp")
     assert res["ok"] is True
     assert res["already_running"] is False
     assert res["port"] == 5180
     assert res["url"] == "http://localhost:5180"
     assert res["pid"] == 1000
-    lease = Lease.read(devctl_home.lease_file_for("webapp", "/proj/webapp"))
-    assert lease.watchdog_pid == 424242
+    assert res["state"] == "running"
+    lease = lease_at(devctl_home, "/proj/webapp")
+    assert lease.schema == 2 and lease.state == "running"
     assert lease.session == "sess-1"
     assert lease.cwd == "/proj/webapp"
-    # The watchdog is spawned for the lease key, not the project (ADR-0007 §5).
-    assert service._spawned == [lease_key("webapp", "/proj/webapp")]
+    # The supervisor is spawned for the lease key, not the project (ADR-0007 §5),
+    # and it is the lease's registered owner.
+    sup = world.sup_for(lease_key("webapp", "/proj/webapp"))
+    assert lease.supervisor == SupervisorRef(sup.pid, sup.start, registered=True)
+    assert res["supervisor_pid"] == sup.pid
+    # New leases never name a watchdog: the schema-2 file carries the poison.
+    assert json.loads(devctl_home.lease_file_for("webapp", "/proj/webapp").read_text())[
+        "watchdog_pid"
+    ] == "supervised"
+
+
+def test_up_writes_the_starting_lease_before_spawning(service, devctl_home, world):
+    """I1: the record exists, with its generation and plan, before anything is
+    spawned — so there is no window in which a workload has no lease (S2)."""
+    seen: list[Lease] = []
+    real_spawn = world.spawn
+
+    def spawn(key, generation, *, paths):
+        seen.append(Lease.read(paths.lease_file(key)))
+        return real_spawn(key, generation, paths=paths)
+
+    world.spawn = spawn
+    service.env_up("webapp", cwd="/proj/webapp")
+    (at_spawn,) = seen
+    assert at_spawn.state == "starting"
+    assert at_spawn.supervisor is None
+    assert len(at_spawn.generation) == 32
+    assert at_spawn.plan["cmd"] == "npm run dev"
+    assert at_spawn.plan["port_env"] == "PORT"
+    assert at_spawn.plan["readiness_timeout_s"] == 30.0
+    assert at_spawn.plan["term_grace_s"] == 0.05
+
+
+def test_up_does_not_write_the_supervisors_up_event_again(service):
+    """The supervisor writes `up` when it reaches running; the waiter reads it."""
+    service.env_up("webapp", cwd="/proj/webapp")
+    assert kinds(service) == ["up"]
 
 
 def test_up_profile_port(service):
@@ -157,24 +176,41 @@ def test_up_profile_port(service):
     assert res["port"] == 5181
 
 
-def test_up_already_running_renews(service, clock, fake_runner):
+def test_up_already_running_renews(service, clock, world):
     first = service.env_up("webapp")
     clock.advance(minutes=30)
     second = service.env_up("webapp", lease_minutes=120)
     assert second["already_running"] is True
     assert second["pid"] == first["pid"]
-    assert len(fake_runner.started) == 1  # not restarted
+    assert len(world.started) == 1  # not restarted
     assert second["lease_expires"] > first["lease_expires"]  # pushed out
 
 
-def test_up_replaces_dead_lease(service, devctl_home, fake_runner):
+def test_up_replaces_a_lease_whose_workload_exited(service, world):
+    """The supervisor notices its session emptied, records `process-gone` and
+    removes the lease; the next `up` starts fresh."""
     service.env_up("webapp")
-    # Simulate the process dying: mark the pid dead in the fake runner.
-    fake_runner._alive[1000] = False
+    world.kill_workload(1000)
+    world.tick()
     res = service.env_up("webapp")
     assert res["already_running"] is False
-    assert res["pid"] == 1001            # a fresh process
-    assert len(fake_runner.started) == 2
+    assert res["pid"] == 1001
+    assert len(world.started) == 2
+    gone = [e for e in events(service) if e["event"] == "down"]
+    assert gone[-1]["reason"] == "process-gone" and gone[-1]["actor"] == "supervisor"
+
+
+def test_up_cleans_a_dead_supervisors_empty_lease_and_starts_fresh(service, world):
+    """§10: supervisor dead, session empty → CLEAN, recorded by `up` itself."""
+    service.env_up("webapp", cwd="/proj/A")
+    key = lease_key("webapp", "/proj/A")
+    world.kill_supervisor(key)
+    world.kill_workload(1000)
+    res = service.env_up("webapp", cwd="/proj/A")
+    assert res["already_running"] is False and res["pid"] == 1001
+    down = [e for e in events(service) if e["event"] == "down"][-1]
+    assert down["reason"] == "sweep-dead" and down["actor"] == "up"
+    assert "supervisor_lost" in kinds(service)
 
 
 def test_up_routes_around_a_squatted_port(service, monkeypatch):
@@ -202,21 +238,41 @@ def test_up_block_exhausted_names_the_holders(service, monkeypatch):
     assert "no rentctl lease" in res["holders"]["5180"]
 
 
-def test_up_start_timeout(devctl_home, write_registry, sample_registry_data, fake_runner, clock):
-    write_registry(sample_registry_data)
-    svc = Service(
-        devctl_home,
-        now_fn=clock,
-        runner_factory=lambda name: fake_runner,
-        readiness_fn=lambda port, timeout, pgid: Readiness.NOT_LISTENING,  # never came up
-        watchdog_spawn=lambda p: None,
-    )
-    res = svc.env_up("webapp")
+def test_up_start_timeout(service, devctl_home, world):
+    """The supervisor's readiness failed: it stopped its own session (verified)
+    and wrote `startup_failed`; the waiter reads the error and consumes it."""
+    world.readiness = "not_listening"
+    res = service.env_up("webapp", cwd="/proj/webapp")
     assert res["ok"] is False
     assert res["error"] == START_TIMEOUT
     assert res["log_tail"]  # captured tail returned for diagnosis
-    assert fake_runner.stopped == [1000]  # the failed process was stopped
-    assert not devctl_home.lease_file("webapp").exists()  # no lease left behind
+    assert world.stopped == [1000]  # the failed workload was stopped
+    assert lease_at(devctl_home, "/proj/webapp") is None  # consumed, not left behind
+    assert "cleanup" not in res  # the stop verified: nothing to report
+    # One up_failed, written by the supervisor — not a second one by the waiter.
+    (failed,) = [e for e in events(service) if e["event"] == "up_failed"]
+    assert failed["phase"] == "readiness" and failed["cleanup"] == "verified"
+
+
+def test_up_start_timeout_names_survivors_of_its_own_stop(service, devctl_home, world):
+    """A startup teardown that leaves survivors keeps the lease as
+    `cleanup_incomplete{phase: startup}`, and the envelope names them."""
+    world.readiness = "not_listening"
+    world.stubborn = True
+    res = service.env_up("webapp", cwd="/proj/webapp")
+    assert res["error"] == START_TIMEOUT
+    assert res["cleanup"] == "incomplete"
+    assert res["state"] == "cleanup_incomplete"
+    assert [s["pid"] for s in res["survivors"]] == [1000]
+    lease = lease_at(devctl_home, "/proj/webapp")
+    assert lease.state == "cleanup_incomplete" and lease.cleanup.phase == "startup"
+
+
+def test_up_exited_during_startup(service, world):
+    world.readiness = "dies"
+    res = service.env_up("webapp", cwd="/proj/webapp")
+    assert res["error"] == START_TIMEOUT
+    assert "exited during startup" in res["message"]
 
 
 def test_up_unknown_project(service):
@@ -225,18 +281,13 @@ def test_up_unknown_project(service):
     assert res["error"] == UNKNOWN_PROJECT
 
 
-def test_up_bad_registry(devctl_home, fake_runner, clock):
+def test_up_bad_registry(devctl_home, world, clock):
     # No registry file written → fail closed.
-    svc = Service(
-        devctl_home,
-        now_fn=clock,
-        runner_factory=lambda name: fake_runner,
-        readiness_fn=lambda p, t, g: Readiness.ANSWERED,
-        watchdog_spawn=lambda p: None,
-    )
+    svc = make_service(devctl_home, world, clock)
     res = svc.env_up("webapp")
     assert res["ok"] is False
     assert res["error"] == REGISTRY_INVALID
+    assert world.sups == {}
 
 
 def test_up_clamps_lease_minutes(service, clock):
@@ -245,9 +296,143 @@ def test_up_clamps_lease_minutes(service, clock):
     assert expires == clock.now + timedelta(minutes=480)  # clamped to max
 
 
+def test_up_spawn_failure_removes_the_starting_lease(service, devctl_home, world):
+    world.spawn_error = DevctlError(SUPERVISOR_START_FAILED, "fork failed")
+    res = service.env_up("webapp", cwd="/proj/webapp")
+    assert res["ok"] is False and res["error"] == SUPERVISOR_START_FAILED
+    assert lease_at(devctl_home, "/proj/webapp") is None
+    (failed,) = [e for e in events(service) if e["event"] == "up_failed"]
+    assert failed["phase"] == "spawn" and failed["error"] == SUPERVISOR_START_FAILED
+
+
+def test_up_state_write_failure_starts_nothing(service, devctl_home, world, monkeypatch):
+    def refuse(self, path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Lease, "write", refuse)
+    res = service.env_up("webapp", cwd="/proj/webapp")
+    assert res["error"] == STATE_WRITE_FAILED
+    assert world.sups == {}  # §6 step 1: nothing was spawned
+    (failed,) = [e for e in events(service) if e["event"] == "up_failed"]
+    assert failed["phase"] == "state_write"
+
+
+def test_up_supervisor_that_dies_before_registering_is_abandoned(service, devctl_home, world):
+    """§6 failure table row 3: a supervisor dead before registering launched
+    nothing (I1). The waiter's liveness check lets §10 abandon the record."""
+    real_spawn = world.spawn
+
+    def spawn_then_die(key, generation, *, paths):
+        ref = real_spawn(key, generation, paths=paths)
+        world.kill_supervisor(key)
+        return ref
+
+    world.spawn = spawn_then_die
+    res = service.env_up("webapp", cwd="/proj/webapp")
+    assert res["ok"] is False and res["error"] == START_TIMEOUT
+    assert "cancelled" in res["message"]
+    assert world.started == []
+    assert lease_at(devctl_home, "/proj/webapp") is None
+    registration = [e for e in events(service) if e.get("phase") == "registration"]
+    assert registration and registration[0]["event"] == "up_failed"
+
+
+def test_up_that_never_reaches_running_asks_its_supervisor_to_stop(service, devctl_home, world):
+    """Past the wait budget the supervisor is alive but stuck: the waiter writes
+    `stop{reason: startup-abandoned}` and reports where the lease is."""
+    world.hung = True
+    res = service.env_up("webapp", cwd="/proj/webapp")
+    assert res["error"] == START_TIMEOUT
+    assert res["state"] == "starting"
+    lease = lease_at(devctl_home, "/proj/webapp")
+    assert lease.stop.reason == "startup-abandoned"
+    world.hung = False
+    world.settle()
+    # It never registered, so it refuses to register over the recorded stop and exits
+    # having launched nothing (I1); the next reconcile abandons the record.
+    assert world.started == []
+    service.env_sweep()
+    assert lease_at(devctl_home, "/proj/webapp") is None
+
+
+# --- concurrent `up` (§14) --------------------------------------------------
+
+def _start_elsewhere(paths, world, clock, cwd="/proj/webapp", port=5180) -> tuple[str, str]:
+    """Another caller's start, left at `starting` with its supervisor spawned."""
+    key = lease_key("webapp", cwd)
+    gen = "e" * 32
+    lease = new_starting_lease(
+        generation=gen, project="webapp", profile="default", runner="process", port=port,
+        session="other", cwd=cwd, spawn_cwd="/tmp/webapp", log=str(paths.log_file("webapp", "x")),
+        plan={"cmd": "npm run dev", "cwd": "/tmp/webapp", "port_env": "PORT"}, now=clock(),
+        expires=clock() + timedelta(hours=1),
+    )
+    ref = world.spawn(key, gen, paths=paths)
+    spawned = transition(lease, Event(EventKind.SPAWNED, clock(), supervisor=ref),
+                         Actor(ActorKind.CLI, gen, supervision.self_ref()))
+    spawned.write(paths.lease_file(key))
+    return key, gen
+
+
+def test_up_on_a_starting_lease_waits_and_reports_already_running(service, devctl_home, world, clock):
+    _start_elsewhere(devctl_home, world, clock)
+    res = service.env_up("webapp", cwd="/proj/webapp")
+    assert res["ok"] is True and res["already_running"] is True
+    assert len(world.started) == 1  # the other start, not a second one
+
+
+def test_up_on_a_starting_lease_reports_its_failure(service, devctl_home, world, clock):
+    _start_elsewhere(devctl_home, world, clock)
+    world.readiness = "not_listening"
+    res = service.env_up("webapp", cwd="/proj/webapp")
+    assert res["ok"] is False and res["error"] == START_TIMEOUT
+
+
+def test_up_on_a_stopping_lease_waits_then_starts_a_fresh_generation(service, devctl_home, world):
+    first = service.env_up("webapp", cwd="/proj/webapp")
+    before = lease_at(devctl_home, "/proj/webapp")
+    service.env_down("webapp", cwd="/proj/webapp", wait_s=0)  # requested, not yet applied
+    res = service.env_up("webapp", cwd="/proj/webapp")
+    assert res["ok"] is True and res["already_running"] is False
+    assert res["pid"] != first["pid"]
+    assert lease_at(devctl_home, "/proj/webapp").generation != before.generation
+
+
+def test_up_on_a_stop_that_never_finishes_is_stop_in_progress(service, devctl_home, world):
+    service.env_up("webapp", cwd="/proj/webapp")
+    world.hung = True
+    service.env_down("webapp", cwd="/proj/webapp", wait_s=0)
+    res = service.env_up("webapp", cwd="/proj/webapp")
+    assert res["ok"] is False and res["error"] == STOP_IN_PROGRESS
+    world.hung = False
+    world.settle()
+
+
+def test_up_on_cleanup_incomplete_refuses_and_names_the_survivors(service, devctl_home, world):
+    """Replacing that record would lose the only record naming them (§14)."""
+    world.stubborn = True
+    service.env_up("webapp", cwd="/proj/webapp")
+    service.env_down("webapp", cwd="/proj/webapp")
+    res = service.env_up("webapp", cwd="/proj/webapp")
+    assert res["ok"] is False and res["error"] == CLEANUP_INCOMPLETE
+    assert [s["pid"] for s in res["survivors"]] == [1000]
+    assert lease_at(devctl_home, "/proj/webapp").state == "cleanup_incomplete"
+
+
+def test_up_on_an_unsupervised_lease_reports_it_without_renewing(service, devctl_home, world):
+    service.env_up("webapp", cwd="/proj/webapp")
+    world.kill_supervisor(lease_key("webapp", "/proj/webapp"))
+    service.env_ls()  # the reconciler marks it unsupervised
+    before = lease_at(devctl_home, "/proj/webapp")
+    res = service.env_up("webapp", cwd="/proj/webapp")
+    assert res["ok"] is True and res["already_running"] is True
+    assert res["state"] == "unsupervised" and "not renewed" in res["detail"]
+    assert lease_at(devctl_home, "/proj/webapp").expires == before.expires
+
+
 # --- concurrent worktrees (ADR-0007 lease identity + ADR-0004 port draw) ---
 
-def test_two_worktrees_get_two_leases_and_two_ports(service, devctl_home, fake_runner):
+def test_two_worktrees_get_two_leases_and_two_ports(service, devctl_home, world):
     """The defect this pair of ADRs exists for: before, lane-2 was handed lane-1's
     server under already_running and never reached port selection."""
     one = service.env_up("webapp", cwd="/worktrees/lane-1")
@@ -257,32 +442,35 @@ def test_two_worktrees_get_two_leases_and_two_ports(service, devctl_home, fake_r
     assert two["already_running"] is False       # not handed lane-1's server
     assert one["port"] == 5180                   # primary keeps the familiar port
     assert two["port"] == 5181                   # sibling draws the next one
-    assert one["pid"] != two["pid"]              # two real processes
-    assert len(fake_runner.started) == 2
+    assert one["pid"] != two["pid"]              # two workloads
+    assert len(world.started) == 2
     assert len(devctl_home.project_lease_files("webapp")) == 2
 
 
-def test_a_lane_teardown_does_not_touch_its_sibling(service, devctl_home, fake_runner):
+def test_a_lane_teardown_does_not_touch_its_sibling(service, devctl_home, world):
     """The false-kill path: lane-1's ordinary session end used to kill lane-2's
     server, because one lease carried one cwd."""
     one = service.env_up("webapp", cwd="/worktrees/lane-1")
     two = service.env_up("webapp", cwd="/worktrees/lane-2")
 
-    service.env_down(cwd="/worktrees/lane-1", reason="session-end")
+    res = service.env_down(cwd="/worktrees/lane-1", reason="session-end")
+    # R0: the hook sends the request and returns; the supervisor finishes.
+    assert [d["pending"] for d in res["downed"]] == [True]
+    world.tick()
 
-    assert one["pid"] in fake_runner.stopped
-    assert two["pid"] not in fake_runner.stopped          # sibling untouched
-    assert not devctl_home.lease_file_for("webapp", "/worktrees/lane-1").exists()
-    assert devctl_home.lease_file_for("webapp", "/worktrees/lane-2").exists()
+    assert one["pid"] in world.stopped
+    assert two["pid"] not in world.stopped                # sibling untouched
+    assert lease_at(devctl_home, "/worktrees/lane-1") is None
+    assert lease_at(devctl_home, "/worktrees/lane-2") is not None
 
 
-def test_each_lane_sees_its_own_env_as_already_running(service, fake_runner):
+def test_each_lane_sees_its_own_env_as_already_running(service, world):
     service.env_up("webapp", cwd="/worktrees/lane-1")
     service.env_up("webapp", cwd="/worktrees/lane-2")
     again = service.env_up("webapp", cwd="/worktrees/lane-2")
     assert again["already_running"] is True
     assert again["port"] == 5181                          # its own, not lane-1's
-    assert len(fake_runner.started) == 2                  # nothing restarted
+    assert len(world.started) == 2                        # nothing restarted
 
 
 def test_third_lane_draws_the_third_port(service):
@@ -308,14 +496,22 @@ def test_eleventh_lane_fails_loud(service):
     assert len(res["holders"]) == 10
 
 
-def test_a_dead_lanes_port_is_reclaimable(service, fake_runner):
-    """Free-ness is derived from liveness, not from a stored free-list."""
+def test_a_dead_lanes_port_is_reclaimable(service, world):
+    """Free-ness is derived from the lifecycle, not from a stored free-list."""
     first = service.env_up("webapp", cwd="/worktrees/lane-1")
-    fake_runner._alive[first["pid"]] = False      # crashed, lease file lingers
+    world.kill_workload(first["pid"])      # crashed; its supervisor notices
+    world.tick()
     assert service.env_up("webapp", cwd="/worktrees/lane-2")["port"] == 5180
 
 
-def test_symlinked_cwd_is_one_instance_not_two(service, tmp_path, fake_runner):
+def test_an_unsupervised_lanes_live_workload_still_holds_its_port(service, world):
+    """A dead supervisor is not a dead server: its port is not handed out."""
+    service.env_up("webapp", cwd="/worktrees/lane-1")
+    world.kill_supervisor(lease_key("webapp", "/worktrees/lane-1"))
+    assert service.env_up("webapp", cwd="/worktrees/lane-2")["port"] == 5181
+
+
+def test_symlinked_cwd_is_one_instance_not_two(service, tmp_path, world):
     real = tmp_path / "real"
     real.mkdir()
     link = tmp_path / "link"
@@ -324,18 +520,47 @@ def test_symlinked_cwd_is_one_instance_not_two(service, tmp_path, fake_runner):
     second = service.env_up("webapp", cwd=str(link))
     assert second["already_running"] is True
     assert second["pid"] == first["pid"]
-    assert len(fake_runner.started) == 1
+    assert len(world.started) == 1
 
 
-# --- env_down -------------------------------------------------------------
+# --- env_down: stop requests, wake, waiting (§8) ------------------------------
 
-def test_down_project(service, devctl_home, fake_runner):
+def test_down_project(service, devctl_home, world):
     service.env_up("webapp", cwd="/proj/webapp")
     res = service.env_down("webapp", cwd="/proj/webapp")
     assert res["ok"] is True
     assert res["was_running"] is True
-    assert 1000 in fake_runner.stopped
-    assert not devctl_home.lease_file_for("webapp", "/proj/webapp").exists()
+    assert res["stopped"] is True
+    assert 1000 in world.stopped
+    assert lease_at(devctl_home, "/proj/webapp") is None
+
+
+def test_down_writes_a_generation_matched_request_and_wakes(service, devctl_home, world):
+    service.env_up("webapp", cwd="/proj/webapp")
+    lease = lease_at(devctl_home, "/proj/webapp")
+    res = service.env_down("webapp", cwd="/proj/webapp", wait_s=0)
+    assert res["pending"] is True and res["stopped"] is None and res["state"] == "stopping"
+    assert f"supervisor {lease.supervisor.pid}" in res["detail"]
+    requested = lease_at(devctl_home, "/proj/webapp")
+    assert requested.stop.generation == lease.generation
+    assert requested.stop.reason == "explicit" and requested.stop.op == "down"
+    assert world.woken == [lease.supervisor.pid]
+    (req,) = [e for e in events(service) if e["event"] == "stop_requested"]
+    assert req["generation"] == lease.generation
+    world.tick()
+    assert lease_at(devctl_home, "/proj/webapp") is None
+
+
+def test_repeated_downs_are_acknowledged_once(service, devctl_home, world):
+    """#9: the first request wins; a repeat is acknowledged with no write and
+    no event, and the teardown gets exactly one `down`."""
+    service.env_up("webapp", cwd="/proj/webapp")
+    service.env_down("webapp", cwd="/proj/webapp", wait_s=0)
+    service.env_down("webapp", cwd="/proj/webapp", reason="session-end", wait_s=0)
+    world.tick()
+    assert kinds(service).count("stop_requested") == 1
+    (down,) = [e for e in events(service) if e["event"] == "down"]
+    assert down["reason"] == "explicit"  # the first reason wins
 
 
 def test_down_not_running_is_idempotent(service):
@@ -344,30 +569,31 @@ def test_down_not_running_is_idempotent(service):
     assert res["was_running"] is False
 
 
-def test_down_by_project_scopes_to_this_cwd(service, devctl_home, fake_runner):
+def test_down_by_project_scopes_to_this_cwd(service, devctl_home, world):
     """An LLM finishing with its own dev server must not reach into a sibling
     lane (ADR-0007 §3)."""
     one = service.env_up("webapp", cwd="/worktrees/lane-1")
     two = service.env_up("webapp", cwd="/worktrees/lane-2")
     service.env_down("webapp", cwd="/worktrees/lane-1")
-    assert one["pid"] in fake_runner.stopped
-    assert two["pid"] not in fake_runner.stopped
-    assert devctl_home.lease_file_for("webapp", "/worktrees/lane-2").exists()
+    assert one["pid"] in world.stopped
+    assert two["pid"] not in world.stopped
+    assert lease_at(devctl_home, "/worktrees/lane-2") is not None
 
 
-def test_down_all_instances_is_opt_in(service, devctl_home, fake_runner):
+def test_down_all_instances_is_opt_in(service, devctl_home, world):
     one = service.env_up("webapp", cwd="/worktrees/lane-1")
     two = service.env_up("webapp", cwd="/worktrees/lane-2")
     res = service.env_down("webapp", all_instances=True)
     assert res["ok"] is True
     assert {d["cwd"] for d in res["downed"]} == {"/worktrees/lane-1", "/worktrees/lane-2"}
-    assert one["pid"] in fake_runner.stopped
-    assert two["pid"] in fake_runner.stopped
+    assert all(d["stopped"] is True for d in res["downed"])
+    assert one["pid"] in world.stopped
+    assert two["pid"] in world.stopped
     assert devctl_home.project_lease_files("webapp") == []
 
 
 def test_down_all_instances_spares_a_project_whose_name_extends_this_one(
-    service, devctl_home, write_registry, sample_registry_data, fake_runner
+    service, devctl_home, write_registry, sample_registry_data, world
 ):
     """WI-0081: ``webapp--v2`` is a legal, distinct project. Its leases start
     with ``webapp--``, and a prefix glob made ``down webapp --all`` kill it."""
@@ -384,9 +610,9 @@ def test_down_all_instances_spares_a_project_whose_name_extends_this_one(
 
     res = service.env_down("webapp", all_instances=True)
     assert [d["cwd"] for d in res["downed"]] == ["/worktrees/lane-1"]
-    assert mine["pid"] in fake_runner.stopped
-    assert theirs["pid"] not in fake_runner.stopped
-    assert devctl_home.lease_file_for("webapp--v2", "/worktrees/lane-1").exists()
+    assert mine["pid"] in world.stopped
+    assert theirs["pid"] not in world.stopped
+    assert lease_at(devctl_home, "/worktrees/lane-1", "webapp--v2") is not None
 
 
 def test_down_all_instances_records_each_as_layer_1(service):
@@ -412,8 +638,50 @@ def test_down_all_by_cwd(service, devctl_home, write_registry, sample_registry_d
     res = service.env_down(cwd="/proj/A")
     assert res["ok"] is True
     assert [d["project"] for d in res["downed"]] == ["webapp"]
-    assert not devctl_home.lease_file_for("webapp", "/proj/A").exists()
-    assert devctl_home.lease_file_for("worldcup", "/proj/B").exists()  # untouched
+    assert lease_at(devctl_home, "/proj/A") is None
+    assert lease_at(devctl_home, "/proj/B", "worldcup") is not None  # untouched
+
+
+def test_session_end_sends_every_request_and_returns_pending(
+    service, devctl_home, write_registry, sample_registry_data, world
+):
+    """R0: `down --all --reason session-end` waits for nothing. Every lease gets
+    its request and its wake; the supervisors finish afterwards."""
+    sample_registry_data["projects"]["worldcup"] = {
+        "block": 5190,
+        "runner": "process",
+        "profiles": {"default": {"cmd": "npm run dev", "cwd": "/tmp/wc", "port_env": "PORT"}},
+    }
+    write_registry(sample_registry_data)
+    service.env_up("webapp", cwd="/proj/A")
+    service.env_up("worldcup", cwd="/proj/A")
+    mono = world.monotonic()
+    res = service.env_down(cwd="/proj/A", reason="session-end")
+    assert world.monotonic() == mono  # never slept: no waiting at all
+    assert {d["project"] for d in res["downed"]} == {"webapp", "worldcup"}
+    assert all(d["pending"] is True and d["state"] == "stopping" for d in res["downed"])
+    assert len(world.woken) == 2
+    world.tick()
+    assert devctl_home.project_lease_files("webapp") == []
+    assert devctl_home.project_lease_files("worldcup") == []
+
+
+def test_explicit_wait_overrides_the_session_end_default(service, devctl_home):
+    service.env_up("webapp", cwd="/proj/A")
+    res = service.env_down(cwd="/proj/A", reason="session-end", wait_s=15)
+    assert [d["stopped"] for d in res["downed"]] == [True]
+
+
+def test_down_past_its_budget_is_pending_and_still_ok(service, devctl_home, world):
+    service.env_up("webapp", cwd="/proj/A")
+    world.hung = True
+    res = service.env_down("webapp", cwd="/proj/A")
+    assert res["ok"] is True
+    assert res["pending"] is True and res["stopped"] is None
+    assert world.monotonic() >= service_mod.DOWN_WAIT_S
+    world.hung = False
+    world.tick()
+    assert lease_at(devctl_home, "/proj/A") is None
 
 
 # --- an empty --cwd is an unexpanded variable, not "no --cwd" (WI-0025) ----
@@ -456,40 +724,106 @@ def test_an_absent_cwd_remains_legal(service):
 
 # --- env_ls ---------------------------------------------------------------
 
-def test_ls_lists_kept(service):
+def test_ls_lists_kept(service, world):
     service.env_up("webapp")
     res = service.env_ls()
     assert res["ok"] is True
     envs = {e["project"]: e for e in res["environments"]}
     assert envs["webapp"]["port"] == 5180
     assert envs["webapp"]["healthy"] is False  # fake server binds no real port
+    assert envs["webapp"]["state"] == "running"
+    assert envs["webapp"]["supervisor"]["alive"] is True
+    assert envs["webapp"]["supervisor"]["registered"] is True
+    assert "pending" not in envs["webapp"]
 
 
-def test_ls_cleans_dead_lease(service, devctl_home, fake_runner):
-    service.env_up("webapp")
-    fake_runner._alive[1000] = False  # process died
+def test_ls_shows_a_pending_stop_and_survivors(service, world):
+    world.stubborn = True
+    service.env_up("webapp", cwd="/proj/A")
+    service.env_down("webapp", cwd="/proj/A", wait_s=0)
+    (row,) = service.env_ls()["environments"]
+    assert row["pending"] is True and row["stop_reason"] == "explicit"
+    world.tick()
+    (row,) = service.env_ls()["environments"]
+    assert row["state"] == "cleanup_incomplete"
+    assert [s["pid"] for s in row["survivors"]] == [1000]
+
+
+def test_ls_cleans_a_dead_supervisors_empty_lease(service, devctl_home, world):
+    service.env_up("webapp", cwd="/proj/A")
+    world.kill_supervisor(lease_key("webapp", "/proj/A"))
+    world.kill_workload(1000)
     res = service.env_ls()
     assert res["environments"] == []
-    assert not devctl_home.lease_file("webapp").exists()  # reconciled away
+    assert lease_at(devctl_home, "/proj/A") is None  # reconciled away
+
+
+def test_supervisor_lost_while_running_is_kept_as_unsupervised(service, devctl_home, world):
+    """§10: a helper crash must not become a dev-server outage. The workload is
+    kept, visibly, and nothing is signalled."""
+    service.env_up("webapp", cwd="/proj/A")
+    world.kill_supervisor(lease_key("webapp", "/proj/A"))
+    (row,) = service.env_ls()["environments"]
+    assert row["state"] == "unsupervised"
+    assert row["supervisor"]["alive"] is False
+    assert world.table.sent == []
+    (lost,) = [e for e in events(service) if e["event"] == "supervisor_lost"]
+    assert lost["detected_by"] == "ls" and lost["state_before"] == "running"
+    # `down` then recovers it in this process, verified.
+    res = service.env_down("webapp", cwd="/proj/A")
+    assert res["stopped"] is True
+    down = [e for e in events(service) if e["event"] == "down"][-1]
+    assert down["mode"] == "recovery" and down["actor"] == "cli" and down["reason"] == "explicit"
+    assert lease_at(devctl_home, "/proj/A") is None
 
 
 # --- env_sweep ------------------------------------------------------------
 
-def test_sweep_removes_dead(service, devctl_home, fake_runner):
-    service.env_up("webapp")
-    fake_runner._alive[1000] = False
+def test_sweep_removes_dead(service, devctl_home, world):
+    service.env_up("webapp", cwd="/proj/A")
+    world.kill_supervisor(lease_key("webapp", "/proj/A"))
+    world.kill_workload(1000)
     res = service.env_sweep()
     assert [s["action"] for s in res["swept"]] == ["clean"]
-    assert not devctl_home.lease_file("webapp").exists()
+    assert lease_at(devctl_home, "/proj/A") is None
 
 
-def test_sweep_expires_live_lease(service, devctl_home, clock, fake_runner):
-    service.env_up("webapp", lease_minutes=120)
-    clock.advance(minutes=121)  # past expiry, process still alive
+def test_sweep_expires_an_unsupervised_lease_through_a_recovery_claim(
+    service, devctl_home, clock, world
+):
+    service.env_up("webapp", lease_minutes=120, cwd="/proj/A")
+    world.kill_supervisor(lease_key("webapp", "/proj/A"))
+    clock.advance(minutes=121)  # past expiry, workload still alive
     res = service.env_sweep()
     assert [s["action"] for s in res["swept"]] == ["expire"]
-    assert 1000 in fake_runner.stopped
-    assert not devctl_home.lease_file("webapp").exists()
+    assert world.table.signals_to(1000) == [signal.SIGTERM]
+    assert lease_at(devctl_home, "/proj/A") is None
+
+
+def test_a_supervised_lease_expires_by_its_own_supervisor(service, devctl_home, clock, world):
+    """Expiry is the supervisor's (layer 3); sweep leaves a live one alone."""
+    service.env_up("webapp", lease_minutes=120, cwd="/proj/A")
+    clock.advance(minutes=121)
+    assert service.env_sweep()["swept"] == []
+    world.tick()
+    assert lease_at(devctl_home, "/proj/A") is None
+    down = [e for e in events(service) if e["event"] == "down"][-1]
+    assert down["reason"] == "expiry" and down["layer"] == 3 and down["actor"] == "supervisor"
+
+
+def test_sweep_nudges_a_hung_supervisor_past_expiry_without_signalling(
+    service, devctl_home, clock, world
+):
+    service.env_up("webapp", lease_minutes=120, cwd="/proj/A")
+    world.hung = True
+    clock.advance(minutes=121)
+    res = service.env_sweep()
+    assert res["swept"] == []
+    assert lease_at(devctl_home, "/proj/A").stop.reason == "expiry"
+    assert world.table.sent == []  # the workload is never signalled from here
+    world.hung = False
+    world.tick()
+    assert lease_at(devctl_home, "/proj/A") is None
 
 
 def test_sweep_keeps_healthy(service):
@@ -499,37 +833,97 @@ def test_sweep_keeps_healthy(service):
     assert [k["project"] for k in res["kept"]] == ["webapp"]
 
 
+def test_sweep_abandons_a_start_that_never_registered(service, devctl_home, world, clock):
+    """#8's seam half: the CLI died before its supervisor registered. I1 means
+    nothing was launched, so the record is simply removed after 30 s."""
+    key, _ = _start_elsewhere(devctl_home, world, clock)
+    world.kill_supervisor(key)
+    world.sups.clear()
+    Lease.read(devctl_home.lease_file(key))  # still there
+    res = service.env_sweep()
+    assert [s["action"] for s in res["swept"]] == ["clean"]
+    assert lease_at(devctl_home, "/proj/webapp") is None
+    assert any(e["event"] == "up_failed" and e["phase"] == "registration" for e in events(service))
+
+
+def test_starting_lease_without_supervisor_abandoned_after_timeout(service, devctl_home, clock):
+    """No supervisor recorded at all: only the registration timeout settles it."""
+    key = lease_key("webapp", "/proj/webapp")
+    lease = new_starting_lease(
+        generation="f" * 32, project="webapp", profile="default", runner="process", port=5180,
+        session="s", cwd="/proj/webapp", spawn_cwd="/tmp/webapp", log="/dev/null",
+        plan={"cmd": "x", "cwd": "/tmp", "port_env": "PORT"}, now=clock(),
+        expires=clock() + timedelta(hours=1),
+    )
+    lease.write(devctl_home.lease_file(key))
+    assert service.env_sweep()["swept"] == []  # inside the timeout: kept
+    clock.advance(seconds=31)
+    assert [s["action"] for s in service.env_sweep()["swept"]] == ["clean"]
+
+
+def test_sweep_recovers_a_dead_supervisors_start(service, devctl_home, world, clock):
+    """#7's seam half: registered and launched, then the supervisor died. Sweep
+    recovers the session and writes `startup_failed`, which is later cleaned."""
+    key, _ = _start_elsewhere(devctl_home, world, clock)
+    sup = world.sup_for(key)
+    real_ready = world.readiness
+    world.readiness = "__never__"
+    # Register and launch by hand, then lose the supervisor before readiness.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(sup, "_teardown", lambda lease, error=None: None)
+        sup.step()
+    world.readiness = real_ready
+    world.kill_supervisor(key)
+    assert Lease.read(devctl_home.lease_file(key)).handle["sid"] == sup.pid
+    res = service.env_sweep()
+    assert [s["action"] for s in res["swept"]] == ["recover"]
+    failed = Lease.read(devctl_home.lease_file(key))
+    assert failed.state == "startup_failed" and failed.error["phase"] == "supervisor_lost"
+    assert world.table.signals_to(1000) == [signal.SIGTERM]
+    clock.advance(seconds=31)
+    service.env_sweep()
+    assert not devctl_home.lease_file(key).exists()
+
+
+def test_sweep_retries_cleanup_incomplete_when_its_supervisor_is_gone(
+    service, devctl_home, world
+):
+    world.stubborn = True
+    service.env_up("webapp", cwd="/proj/A")
+    service.env_down("webapp", cwd="/proj/A")
+    world.kill_supervisor(lease_key("webapp", "/proj/A"))
+    for proc in world.table.procs.values():
+        proc.unkillable = proc.ignores_term = False  # the survivor becomes stoppable
+    res = service.env_sweep()
+    assert [s["action"] for s in res["swept"]] == ["stop"]
+    assert lease_at(devctl_home, "/proj/A") is None
+
+
+def test_ambiguous_identity_is_kept_flagged_and_never_signalled(service, devctl_home, world):
+    """PID S reused by a stranger while members remain: keep, surface, no signal."""
+    world.stubborn = True
+    service.env_up("webapp", cwd="/proj/A")
+    service.env_down("webapp", cwd="/proj/A")
+    sup = world.kill_supervisor(lease_key("webapp", "/proj/A"))
+    world.table.add(sup.pid, 1, sup.start + 999, name="stranger")  # PID S reused
+    sent = list(world.table.sent)
+    res = service.env_sweep()
+    assert res["swept"] == []
+    (row,) = res["kept"]
+    assert row["identity_ambiguous"] is True
+    assert world.table.sent == sent
+    assert lease_at(devctl_home, "/proj/A").cleanup.identity_ambiguous is True
+
+
 # --- a teardown that did not work must not report one (WI-0031) -----------
 
-class StubbornRunner(FakeRunner):
-    """A runner whose `stop()` signals and achieves nothing.
-
-    Not contrived: `ProcessRunner.stop()` returns None and swallows a failed
-    signal, and a process in uninterruptible sleep (blocked on a mounted volume,
-    which is how this machine serves projects) survives SIGKILL past the grace
-    window. There was no test in the suite for a stop that fails."""
-
-    def stop(self, handle):
-        self.stopped.append(handle.pid)   # we tried…
-        # …and the process is still there.
-
-
 @pytest.fixture
-def stubborn_service(devctl_home, write_registry, sample_registry_data, clock, monkeypatch):
-    write_registry(sample_registry_data)
-    monkeypatch.setattr(procutil, "port_owner", lambda port: None)
-    monkeypatch.setattr(service_mod, "_port_answering", lambda port: False)
-    runner = StubbornRunner()
-    svc = Service(
-        devctl_home,
-        now_fn=clock,
-        runner_factory=lambda name: runner,
-        readiness_fn=lambda port, timeout, pgid: Readiness.ANSWERED,
-        watchdog_spawn=lambda p: None,
-        session_id_fn=lambda: "sess-1",
-    )
-    svc._runner = runner  # type: ignore[attr-defined]
-    return svc
+def stubborn_service(service, world):
+    """A workload whose members survive TERM and KILL — a process in
+    uninterruptible sleep (blocked on a mounted volume, which is how this
+    machine serves projects), or a child that changed uid."""
+    world.stubborn = True
+    return service
 
 
 def test_a_failed_teardown_keeps_the_lease(stubborn_service, devctl_home):
@@ -539,37 +933,47 @@ def test_a_failed_teardown_keeps_the_lease(stubborn_service, devctl_home):
     stubborn_service.env_up("webapp", cwd="/proj/A")
     res = stubborn_service.env_down(project="webapp", cwd="/proj/A")
     assert res["stopped"] is False
-    assert "still alive" in res["detail"]
-    assert devctl_home.lease_file_for("webapp", "/proj/A").exists()
+    assert res["state"] == "cleanup_incomplete"
+    assert "survivors" in res["detail"]
+    assert [s["pid"] for s in res["survivors"]] == [1000]
+    assert lease_at(devctl_home, "/proj/A") is not None
 
 
 def test_a_failed_teardown_is_not_recorded_as_a_kill(stubborn_service):
     """`killed` used to be the liveness reading taken BEFORE the attempt — a
-    claim about intent. False layer-2 evidence is worse than no evidence."""
+    claim about intent. False layer-2 evidence is worse than no evidence.
+
+    Since ADR-0016 §13 a failed stop is not a `down` row at all: 1.0.x wrote
+    `down{stop_failed: true}` and `summarize` counted it as a teardown."""
     stubborn_service.env_up("webapp", cwd="/proj/A")
     stubborn_service.env_down(project="webapp", cwd="/proj/A")
-    down = [e for e in stubborn_service.events.read() if e["event"] == "down"][-1]
-    assert down["killed"] is False
-    assert down["stop_failed"] is True
+    found = stubborn_service.events.read()
+    assert [e for e in found if e["event"] == "down"] == []
+    (incomplete,) = [e for e in found if e["event"] == "cleanup_incomplete"]
+    assert incomplete["reason"] == "explicit"
+    assert incomplete["identity_ambiguous"] is False
+    assert "layer" not in incomplete
 
 
-def test_sweep_does_not_report_a_survivor_as_swept(stubborn_service, clock, devctl_home):
+def test_sweep_does_not_report_a_survivor_as_swept(stubborn_service, clock, devctl_home, world):
     """Reporting it as swept is how a live server becomes invisible: gone from
     `kept`, gone from the lease dir, and named nowhere."""
     stubborn_service.env_up("webapp", cwd="/proj/A")
     clock.advance(hours=3)
+    world.tick()  # its supervisor tries the expiry stop; the survivor stays
     res = stubborn_service.env_sweep()
     assert res["swept"] == []
     assert [k["project"] for k in res["kept"]] == ["webapp"]
-    assert devctl_home.lease_file_for("webapp", "/proj/A").exists()
+    assert res["kept"][0]["state"] == "cleanup_incomplete"
+    assert lease_at(devctl_home, "/proj/A") is not None
 
 
 def test_a_successful_teardown_still_reports_a_kill(service):
     """The honest path must be unchanged — this is the regression guard for the
-    fix itself."""
+    fix itself. Since ADR-0016 §8 it also says `stopped: true` in so many words."""
     service.env_up("webapp", cwd="/proj/A")
     res = service.env_down(project="webapp", cwd="/proj/A")
-    assert "stopped" not in res
+    assert res["stopped"] is True
     down = [e for e in service.events.read() if e["event"] == "down"][-1]
     assert down["killed"] is True
     assert "stop_failed" not in down
@@ -702,13 +1106,14 @@ def test_sweep_reports_a_drifted_command(service, write_registry, sample_registr
 
 
 def test_sweep_still_reconciles_despite_drift(
-    service, devctl_home, write_registry, sample_registry_data, tmp_path, clock, fake_runner
+    service, devctl_home, write_registry, sample_registry_data, tmp_path, clock, world
 ):
     """The load-bearing property. Refusing to clean up because a config drifted
     would leave a real server running to guard against a command sweep was never
     going to execute — fail-closed and fail-safe point opposite ways here, and
     cleanup follows fail-safe."""
     service.env_up("webapp", cwd="/proj/A")
+    world.kill_supervisor(lease_key("webapp", "/proj/A"))  # so the sweep is what acts
     root = tmp_path / "proj"
     root.mkdir()
     write_registry(_drifted_registry(sample_registry_data, root))
@@ -716,7 +1121,7 @@ def test_sweep_still_reconciles_despite_drift(
     res = service.env_sweep()
     assert res["command_drift"]  # drift seen…
     assert [s["project"] for s in res["swept"]] == ["webapp"]  # …and the sweep still ran
-    assert not devctl_home.lease_file_for("webapp", "/proj/A").exists()
+    assert lease_at(devctl_home, "/proj/A") is None
 
 
 def test_sweep_is_silent_when_nothing_drifted(service):
@@ -739,7 +1144,7 @@ def test_sweep_reports_squatter_advisory(service, monkeypatch):
 
 
 def test_sweep_strict_kills_squatter(
-    devctl_home, write_registry, sample_registry_data, fake_runner, clock, monkeypatch
+    devctl_home, write_registry, sample_registry_data, world, clock, monkeypatch
 ):
     sample_registry_data["enforcement"] = "strict"
     write_registry(sample_registry_data)
@@ -748,18 +1153,207 @@ def test_sweep_strict_kills_squatter(
         "port_owner",
         lambda port: ProcInfo(pid=888, name="vite", cmdline=()) if port == 5180 else None,
     )
-    killed: list[int] = []
-    monkeypatch.setattr("rentctl.core.service.os.kill", lambda pid, sig: killed.append(pid))
-    svc = Service(
-        devctl_home,
-        now_fn=clock,
-        runner_factory=lambda name: fake_runner,
-        readiness_fn=lambda p, t, g: Readiness.ANSWERED,
-        watchdog_spawn=lambda p: None,
+    world.table.add(888, 888, 50.0, name="vite")  # a foreign session, no lease
+    svc = make_service(devctl_home, world, clock)
+    res = svc.env_sweep()
+    assert world.table.signals_to(888) == [signal.SIGTERM]  # one TERM, no escalation
+    (row,) = res["killed_squatters"]
+    assert row["killed"] is True and row["outcome"] == "signalled" and row["port"] == 5180
+    (rec,) = [e for e in events(svc) if e["event"] == "squatter_reclaim"]
+    assert rec["killed"] is True and rec["pid"] == 888 and rec["signal"] == "SIGTERM"
+    assert rec["start_time"] == 50.0 and rec["sid"] == 888
+    assert "down" not in kinds(svc)  # a reclaim is never counted as a teardown
+
+
+# --- ADR-0016 §11 (S4): strict reclaim is re-decided under the project lock ---
+
+
+def _strict_service(devctl_home, write_registry, sample_registry_data, world, clock):
+    sample_registry_data["enforcement"] = "strict"
+    write_registry(sample_registry_data)
+    return make_service(devctl_home, world, clock)
+
+
+def test_strict_reclaim_rechecks_start_time_under_lock(
+    devctl_home, write_registry, sample_registry_data, world, clock, monkeypatch
+):
+    """S4 seam: the snapshot saw pid 888 on 5180; by the time the sweep holds
+    L, 888 has exited and the pid names a different process. The re-probe
+    under L finds the same pid listening but a different start time: no signal.
+    The re-probe is asserted to run while L is held."""
+    held: list[str] = []
+    real_lock = service_mod.project_lock
+
+    @contextmanager
+    def instrumented(path):
+        with real_lock(path):
+            held.append(str(path))
+            try:
+                yield
+            finally:
+                held.pop()
+
+    monkeypatch.setattr(service_mod, "project_lock", instrumented)
+    world.table.add(888, 888, 50.0, name="vite")
+    probes: list[list[str]] = []
+
+    def owner(port):
+        if port != 5180:
+            return None
+        probes.append(list(held))
+        if len(probes) == 2:  # the re-probe: 888 was recycled in between
+            world.table.kill_now(888)
+            world.table.add(888, 888, 9999.0, name="other")
+        return ProcInfo(pid=888, name="vite", cmdline=())
+
+    monkeypatch.setattr(procutil, "port_owner", owner)
+    svc = _strict_service(devctl_home, write_registry, sample_registry_data, world, clock)
+    res = svc.env_sweep()
+    assert probes[0] == []  # the snapshot is lock-free…
+    assert probes[1] == [str(devctl_home.lock_file("webapp"))]  # …the recheck is under L
+    assert world.table.sent == []
+    (row,) = res["killed_squatters"]
+    assert row["killed"] is False and row["outcome"] == "identity_mismatch"
+    (rec,) = [e for e in events(svc) if e["event"] == "squatter_reclaim"]
+    assert rec["killed"] is False and rec["outcome"] == "identity_mismatch"
+    assert "signal" not in rec
+
+
+def test_strict_reclaim_identity_change_after_recheck_is_refused_by_verified_signal(
+    devctl_home, write_registry, sample_registry_data, world, clock, monkeypatch
+):
+    """The last window: identity changes between the recheck and the signal.
+    `verified_signal` re-verifies inside the send and refuses."""
+    world.table.add(888, 888, 50.0, name="vite")
+    monkeypatch.setattr(
+        procutil, "port_owner",
+        lambda port: ProcInfo(pid=888, name="vite", cmdline=()) if port == 5180 else None,
+    )
+
+    def recycle(pid):
+        world.table.kill_now(pid)
+        world.table.add(pid, pid, 9999.0, name="other")
+
+    world.table.before_verify = recycle
+    svc = _strict_service(devctl_home, write_registry, sample_registry_data, world, clock)
+    res = svc.env_sweep()
+    assert world.table.sent == []
+    (row,) = res["killed_squatters"]
+    assert row["killed"] is False and row["outcome"] == "identity_mismatch"
+
+
+def test_strict_reclaim_skips_a_port_a_starting_lease_claimed_after_the_snapshot(
+    devctl_home, write_registry, sample_registry_data, world, clock, monkeypatch
+):
+    """S4 seam, the readiness-window race: the lock-free snapshot saw a leaseless
+    listener on 5180, then an `up` wrote its `starting` lease (§6: before its
+    first process) and its workload bound mid-readiness. Under L the port is
+    held by a non-terminal lease, so nothing is re-probed or signalled."""
+    world.table.add(888, 888, 50.0, name="vite")
+    probes: list[int] = []
+
+    def owner(port):
+        if port != 5180:
+            return None
+        probes.append(port)
+        if len(probes) == 1:  # right after the snapshot, an up claims 5180
+            t = clock()
+            new_starting_lease(
+                generation="g" * 32, project="webapp", profile="default", runner="process",
+                port=5180, session="s", cwd="/proj/A", spawn_cwd="/proj/A", log="/dev/null",
+                plan={"cmd": "true", "cwd": "/proj/A", "port_env": "PORT"},
+                now=t, expires=t + timedelta(hours=1),
+            ).write(devctl_home.lease_file_for("webapp", "/proj/A"))
+        return ProcInfo(pid=888, name="vite", cmdline=())
+
+    monkeypatch.setattr(procutil, "port_owner", owner)
+    svc = _strict_service(devctl_home, write_registry, sample_registry_data, world, clock)
+    res = svc.env_sweep()
+    assert probes == [5180]  # never re-probed: refused on the lease alone
+    assert world.table.sent == []
+    (row,) = res["killed_squatters"]
+    assert row["killed"] is False and row["outcome"] == "leased"
+
+
+def test_strict_reclaim_never_signals_a_listener_in_a_live_leases_session(
+    devctl_home, write_registry, sample_registry_data, world, clock, monkeypatch
+):
+    """§11 precondition 2: a running lease's workload that bound a second block
+    port is that lease's, not a squatter — at snapshot and under L alike."""
+    svc = _strict_service(devctl_home, write_registry, sample_registry_data, world, clock)
+    monkeypatch.setattr(procutil, "port_owner", lambda port: None)
+    assert svc.env_up("webapp", cwd="/proj/A")["ok"] is True
+    ident = lease_at(devctl_home, "/proj/A").ownership()
+    world.table.add(4242, ident.sid, ident.owner_start + 1, name="node")
+    monkeypatch.setattr(
+        procutil, "port_owner",
+        lambda port: ProcInfo(pid=4242, name="node", cmdline=()) if port == 5187 else None,
     )
     res = svc.env_sweep()
-    assert 888 in killed
-    assert any(k["killed"] for k in res["killed_squatters"])
+    assert "killed_squatters" not in res and "squatters" not in res
+    # And had the snapshot raced the lease (row taken before it existed), the
+    # decision under L still refuses on the session.
+    sq = service_mod._Squatter("webapp", 5187, 4242, "node", ident.owner_start + 1, ident.sid)
+    (row,) = svc._kill_squatters([sq])
+    assert row["killed"] is False and row["outcome"] == "lease_session"
+    assert world.table.signals_to(4242) == []
+
+
+@pytest.mark.parametrize(
+    "case, expected",
+    [
+        ("unreadable", "lease_unreadable"),
+        ("unverifiable", "unverifiable"),
+        ("probe", "probe_unavailable"),
+        ("gone", "gone"),
+        ("changed", "listener_changed"),
+        ("zombie", "gone"),
+    ],
+)
+def test_strict_reclaim_refusals(
+    case, expected, devctl_home, write_registry, sample_registry_data, world, clock, monkeypatch
+):
+    """Every way the decision under L can refuse, and none of them signals."""
+    svc = _strict_service(devctl_home, write_registry, sample_registry_data, world, clock)
+    world.table.add(888, 888, 50.0, name="vite")
+    sq = service_mod._Squatter("webapp", 5180, 888, "vite", 50.0, 888)
+    owner = ProcInfo(pid=888, name="vite", cmdline=())
+    if case == "unreadable":
+        devctl_home.lease_file_for("webapp", "/proj/Z").write_text("{not json")
+    elif case == "unverifiable":
+        sq = service_mod._Squatter("webapp", 5180, 888, "vite", None, None)
+    elif case == "probe":
+        _probe_unavailable(monkeypatch)
+    elif case == "gone":
+        owner = None
+    elif case == "changed":
+        owner = ProcInfo(pid=889, name="vite", cmdline=())
+    elif case == "zombie":
+        world.table.procs[888].status = psutil.STATUS_ZOMBIE
+    if case != "probe":
+        monkeypatch.setattr(procutil, "port_owner", lambda port: owner)
+    (row,) = svc._kill_squatters([sq])
+    assert row["killed"] is False and row["outcome"] == expected
+    assert world.table.sent == []
+
+
+def test_advisory_sweep_reports_and_never_signals(
+    service, devctl_home, world, monkeypatch
+):
+    """Advisory is unchanged: the squatter is reported, nothing is locked for
+    it, nothing is signalled, and no reclaim is recorded."""
+    world.table.add(888, 888, 50.0, name="vite")
+    monkeypatch.setattr(
+        procutil, "port_owner",
+        lambda port: ProcInfo(pid=888, name="vite", cmdline=()) if port == 5180 else None,
+    )
+    res = service.env_sweep()
+    assert res["squatters"] == [
+        {"project": "webapp", "port": 5180, "pid": 888, "name": "vite", "status": "squatter"}
+    ]
+    assert "killed_squatters" not in res
+    assert world.table.sent == []
+    assert "squatter_reclaim" not in kinds(service)
 
 
 # --- ADR-0008: an unrunnable listener probe never reads as a clean board ---
@@ -814,7 +1408,7 @@ def test_sweep_marks_an_unverified_sweep(service, monkeypatch):
 
 
 def test_strict_sweep_kills_nothing_when_the_probe_is_unavailable(
-    devctl_home, write_registry, sample_registry_data, fake_runner, clock, monkeypatch
+    devctl_home, write_registry, sample_registry_data, world, clock, monkeypatch
 ):
     """The safety-critical case.
 
@@ -829,13 +1423,7 @@ def test_strict_sweep_kills_nothing_when_the_probe_is_unavailable(
     _probe_unavailable(monkeypatch)
     killed: list[int] = []
     monkeypatch.setattr("rentctl.core.service.os.kill", lambda pid, sig: killed.append(pid))
-    svc = Service(
-        devctl_home,
-        now_fn=clock,
-        runner_factory=lambda name: fake_runner,
-        readiness_fn=lambda p, t, g: Readiness.ANSWERED,
-        watchdog_spawn=lambda p: None,
-    )
+    svc = make_service(devctl_home, world, clock)
     res = svc.env_sweep()
     assert killed == []
     assert "killed_squatters" not in res
@@ -844,10 +1432,6 @@ def test_strict_sweep_kills_nothing_when_the_probe_is_unavailable(
 
 # --- the event log: what actually happened, and which layer did it ---------
 # (spec §8 cleanup layers; §11.1 G4 is scored from these records)
-
-def events(service):
-    return service.events.read()
-
 
 def test_up_records_the_start(service):
     service.env_up("webapp", cwd="/proj/webapp")
@@ -859,6 +1443,7 @@ def test_up_records_the_start(service):
     assert rec["session"] == "sess-1"
     assert rec["cwd"] == "/proj/webapp"
     assert rec["already_running"] is False
+    assert rec["generation"] and rec["supervisor_pid"]
 
 
 def test_up_on_running_env_records_a_renewal(service, clock):
@@ -868,6 +1453,7 @@ def test_up_on_running_env_records_a_renewal(service, clock):
     first, second = events(service)
     assert first["already_running"] is False
     assert second["already_running"] is True
+    assert second["generation"] == first["generation"]
 
 
 def test_up_failure_is_recorded(service, monkeypatch):
@@ -894,19 +1480,25 @@ def test_down_by_project_is_declared_layer_1(service):
 def test_down_all_without_a_reason_is_inferred(service):
     """`devctl down --all` typed by hand looks exactly like the SessionEnd hook.
     The reason is still recorded — but marked a guess, so it cannot pass as proof
-    that layer 2 fired."""
+    that layer 2 fired. It also waits like any explicit `down`."""
     service.env_up("webapp", cwd="/proj/A")
-    service.env_down(cwd="/proj/A")
+    res = service.env_down(cwd="/proj/A")
+    assert [d["stopped"] for d in res["downed"]] == [True]
     rec = events(service)[-1]
     assert rec["reason"] == "session-end"
     assert rec["layer"] == 2
     assert rec["reason_source"] == "inferred"
 
 
-def test_down_all_with_a_declared_reason_is_layer_2_evidence(service):
+def test_down_all_with_a_declared_reason_is_layer_2_evidence(service, world):
     service.env_up("webapp", cwd="/proj/A")
     service.env_down(cwd="/proj/A", reason="session-end")
+    req = events(service)[-1]
+    # The hook's own evidence, inside its budget: the request (§13).
+    assert req["event"] == "stop_requested" and req["reason"] == "session-end"
+    world.tick()
     rec = events(service)[-1]
+    assert rec["event"] == "down"
     assert rec["layer"] == 2
     assert rec["reason_source"] == "declared"
     assert rec["killed"] is True
@@ -920,20 +1512,24 @@ def test_down_with_no_lease_records_nothing(service):
     assert events(service) == []
 
 
-def test_sweep_expiry_is_layer_4_kill(service, clock, fake_runner):
-    service.env_up("webapp", lease_minutes=120)
+def test_sweep_expiry_is_layer_4_kill(service, clock, world):
+    service.env_up("webapp", lease_minutes=120, cwd="/proj/A")
+    world.kill_supervisor(lease_key("webapp", "/proj/A"))
     clock.advance(minutes=121)
     service.env_sweep()
     rec = events(service)[-1]
+    assert rec["event"] == "down"
     assert rec["reason"] == "sweep-expired"
     assert rec["layer"] == 4
     assert rec["op"] == "sweep"
     assert rec["killed"] is True
+    assert rec["mode"] == "recovery"
 
 
-def test_sweep_of_dead_process_is_recorded_as_no_kill(service, fake_runner):
-    service.env_up("webapp")
-    fake_runner._alive[1000] = False  # died on its own
+def test_sweep_of_dead_process_is_recorded_as_no_kill(service, world):
+    service.env_up("webapp", cwd="/proj/A")
+    world.kill_supervisor(lease_key("webapp", "/proj/A"))
+    world.kill_workload(1000)  # died on its own, and nobody supervised it
     service.env_sweep()
     rec = events(service)[-1]
     assert rec["reason"] == "sweep-dead"
@@ -941,29 +1537,30 @@ def test_sweep_of_dead_process_is_recorded_as_no_kill(service, fake_runner):
     assert rec["killed"] is False
 
 
-def test_ls_reconcile_is_recorded_under_its_own_op(service, fake_runner):
+def test_ls_reconcile_is_recorded_under_its_own_op(service, world):
     """`ls` reconciles too, so it can tear down — the record says which command did."""
-    service.env_up("webapp")
-    fake_runner._alive[1000] = False
+    service.env_up("webapp", cwd="/proj/A")
+    world.kill_supervisor(lease_key("webapp", "/proj/A"))
+    world.kill_workload(1000)
     service.env_ls()
     rec = events(service)[-1]
     assert rec["op"] == "ls"
     assert rec["layer"] == 4
 
 
-def test_event_log_failure_does_not_break_a_teardown(service, devctl_home, fake_runner):
+def test_event_log_failure_does_not_break_a_teardown(service, devctl_home, world):
     """Fail open: if the log cannot be written, the kill still happens."""
-    service.env_up("webapp")
+    service.env_up("webapp", cwd="/proj/A")
     service.events.path = devctl_home.state_dir / "logs" / "webapp-blocked.log" / "events.jsonl"
     (devctl_home.state_dir / "logs" / "webapp-blocked.log").write_text("a file, not a dir")
-    res = service.env_down("webapp")
+    res = service.env_down("webapp", cwd="/proj/A")
     assert res["ok"] is True
     assert res["was_running"] is True
-    assert 1000 in fake_runner.stopped
-    assert not devctl_home.lease_file("webapp").exists()
+    assert 1000 in world.stopped
+    assert lease_at(devctl_home, "/proj/A") is None
 
 
-def test_ls_registry_invalid_still_lists_leases(service, devctl_home, monkeypatch):
+def test_ls_registry_invalid_still_lists_leases(service, devctl_home):
     service.env_up("webapp")
     # Corrupt the registry after the lease exists.
     devctl_home.registry_file.write_text("{bad")
@@ -996,7 +1593,7 @@ def _init_repo_with_worktree(root: Path) -> tuple[Path, Path]:
 
 
 @pytest.fixture
-def worktree_service(tmp_path, devctl_home, write_registry, fake_runner, clock):
+def worktree_service(tmp_path, devctl_home, write_registry, world, clock, monkeypatch):
     """A service whose registry points at a real repo's frontend/ subdirectory."""
     main, lane = _init_repo_with_worktree(tmp_path / "repo")
     write_registry(
@@ -1016,25 +1613,18 @@ def worktree_service(tmp_path, devctl_home, write_registry, fake_runner, clock):
             }
         }
     )
-    svc = Service(
-        devctl_home,
-        now_fn=clock,
-        runner_factory=lambda name: fake_runner,
-        readiness_fn=lambda port, timeout, pgid: Readiness.ANSWERED,
-        watchdog_spawn=lambda key: 424242,
-        session_id_fn=lambda: "sess-1",
-    )
-    return svc, main, lane
+    monkeypatch.setattr(procutil, "port_owner", lambda port: None)
+    return make_service(devctl_home, world, clock), main, lane
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
-def test_up_from_a_lane_spawns_in_that_lane(worktree_service, fake_runner, devctl_home):
+def test_up_from_a_lane_spawns_in_that_lane(worktree_service, world, devctl_home):
     """The reported bug: a lane's server must serve the lane, not the main checkout."""
     svc, main, lane = worktree_service
     res = svc.env_up("webapp", cwd=str(lane))
     assert res["ok"] is True
-    # What actually got spawned — the whole point.
-    assert fake_runner.start_cwds == [str((lane / "frontend").resolve())]
+    # What the supervisor was told to run it in — the whole point.
+    assert world.start_cwds == [str((lane / "frontend").resolve())]
     # ...and it is visible to the caller rather than something they must infer.
     assert res["serving"] == str((lane / "frontend").resolve())
     # The lease still belongs to the lane it was requested from (ADR-0007),
@@ -1042,46 +1632,47 @@ def test_up_from_a_lane_spawns_in_that_lane(worktree_service, fake_runner, devct
     lease = Lease.read(devctl_home.lease_file_for("webapp", str(lane)))
     assert lease.cwd == str(lane.resolve())
     assert lease.spawn_cwd == str((lane / "frontend").resolve())
+    assert lease.plan["cwd"] == str((lane / "frontend").resolve())
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
-def test_up_from_the_main_checkout_is_unchanged(worktree_service, fake_runner):
+def test_up_from_the_main_checkout_is_unchanged(worktree_service, world):
     """No re-rooting when the caller is the enrolled checkout — same as before."""
     svc, main, lane = worktree_service
     res = svc.env_up("webapp", cwd=str(main))
-    assert fake_runner.start_cwds == [str((main / "frontend").resolve())]
+    assert [Path(c).resolve() for c in world.start_cwds] == [(main / "frontend").resolve()]
     assert res["serving"] == str((main / "frontend").resolve())
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
-def test_up_from_an_unrelated_directory_uses_the_approved_cwd(worktree_service, fake_runner, tmp_path):
+def test_up_from_an_unrelated_directory_uses_the_approved_cwd(worktree_service, world, tmp_path):
     """Fail toward the operator-approved directory, never toward an unverified one."""
     svc, main, lane = worktree_service
     stranger = tmp_path / "stranger"
     stranger.mkdir()
     svc.env_up("webapp", cwd=str(stranger))
-    assert fake_runner.start_cwds == [str((main / "frontend").resolve())]
+    assert [Path(c).resolve() for c in world.start_cwds] == [(main / "frontend").resolve()]
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
-def test_two_lanes_get_two_ports_and_two_directories(worktree_service, fake_runner, tmp_path):
+def test_two_lanes_get_two_ports_and_two_directories(worktree_service, world, tmp_path):
     """The full ADR-0007 + ADR-0010 promise, which the bug half-delivered."""
     svc, main, lane = worktree_service
     a = svc.env_up("webapp", cwd=str(lane))
     b = svc.env_up("webapp", cwd=str(main))
     assert a["port"] != b["port"]
-    assert fake_runner.start_cwds == [
-        str((lane / "frontend").resolve()),
-        str((main / "frontend").resolve()),
+    assert [Path(c).resolve() for c in world.start_cwds] == [
+        (lane / "frontend").resolve(),
+        (main / "frontend").resolve(),
     ]
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
 def test_up_from_a_lane_whose_subdir_escapes_is_refused_not_spawned(
-    worktree_service, fake_runner, devctl_home, tmp_path
+    worktree_service, world, devctl_home, tmp_path
 ):
     """WI-0068: a lane's ``frontend`` symlinked outside the repo must never reach
-    the runner — and must not quietly run the main checkout instead either."""
+    the supervisor — and must not quietly run the main checkout instead either."""
     svc, main, lane = worktree_service
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -1091,173 +1682,39 @@ def test_up_from_a_lane_whose_subdir_escapes_is_refused_not_spawned(
     res = svc.env_up("webapp", cwd=str(lane))
     assert res["ok"] is False
     assert res["error"] == CWD_ESCAPES_ROOT
-    assert fake_runner.start_cwds == []
+    assert world.start_cwds == []
+    assert world.sups == {}
     assert not devctl_home.lease_file_for("webapp", str(lane)).exists()
 
 
-# --- readiness: "not on loopback" is not "did not start" --------------------
+# --- readiness, as the waiting `up` reports it ------------------------------
 #
-# Reported from a pilot project, 2026-07-30. A server that binds a specific
-# address (a tailnet address, a chosen interface) answers there and NEVER on
-# loopback, so the old probe timed out and env_up killed a process that had
-# started perfectly. The log line proving it was up travelled inside the
-# failure payload: that is the tell these tests exist to keep.
-#
-# The fakes below run the REAL readiness probe and fake only the machine, so the
-# branch under test is the shipped one rather than an injected stand-in.
+# The probe itself — loopback, then the owner attributed by SESSION — runs in
+# the supervisor now and is tested there (test_supervisor_readiness.py). What
+# the service owns is carrying the verdict the supervisor wrote to the caller.
 
 
-@pytest.fixture
-def readiness_service(devctl_home, write_registry, sample_registry_data, fake_runner, clock):
-    """Build a Service whose readiness probe is the real one."""
-    write_registry(sample_registry_data)
-
-    def build(**kw):
-        return Service(
-            devctl_home,
-            now_fn=clock,
-            runner_factory=lambda name: fake_runner,
-            # Small but non-zero: the NOT_LISTENING paths must actually poll out.
-            readiness_timeout=0.25,
-            watchdog_spawn=lambda key: None,
-            session_id_fn=lambda: "sess-1",
-            **kw,
-        )
-
-    return build
-
-
-def _listens_after_start(fake_runner, pid):
-    """Nothing is listening until the runner starts — then our child is.
-
-    Stateful on purpose: the port DRAW asks the same probe, so a fake that
-    always reports a listener would make the draw skip the port it is meant to
-    hand out, and the test would pass for the wrong reason.
-    """
-
-    def owner(port):
-        return ProcInfo(pid=pid, name="node", cmdline=()) if fake_runner.started else None
-
-    return owner
-
-
-def test_up_keeps_a_server_that_bound_a_non_loopback_address(
-    readiness_service, fake_runner, monkeypatch
-):
-    """THE regression: started, listening, not on loopback → keep it."""
-    monkeypatch.setattr(service_mod, "_port_answering", lambda port: False)
-    # The listener is pid 31337 — a *child* (npm → node), not the spawned shell.
-    # Its process group is the shell's pid, which is what proves it is ours.
-    monkeypatch.setattr(procutil, "port_owner", _listens_after_start(fake_runner, 31337))
-    monkeypatch.setattr(
-        procutil, "process_group_of", lambda pid: 1000 if pid in (1000, 31337) else None
-    )
-
-    res = readiness_service().env_up("webapp", cwd="/proj/webapp")
-
+def test_up_reports_a_server_that_bound_a_non_loopback_address(service, world):
+    world.readiness = "listening"
+    res = service.env_up("webapp", cwd="/proj/webapp")
     assert res["ok"] is True
     assert res["readiness"] == "listening"
-    assert fake_runner.stopped == []  # it used to be killed right here
+    assert world.stopped == []
     assert "will not reach it" in res["readiness_detail"]
 
 
-def test_up_still_kills_a_server_that_never_listened(
-    readiness_service, fake_runner, monkeypatch
-):
-    """The real F8 is unchanged: probe ran, nothing of ours is there → stop it."""
-    monkeypatch.setattr(service_mod, "_port_answering", lambda port: False)
-    monkeypatch.setattr(procutil, "port_owner", lambda port: None)  # verified empty
-
-    res = readiness_service().env_up("webapp", cwd="/proj/webapp")
-
-    assert res["ok"] is False
-    assert res["error"] == "START_TIMEOUT"
-    assert fake_runner.stopped == [1000]
-    assert res["log_tail"]  # the diagnosis still travels
-
-
-def test_up_kills_when_a_foreign_process_holds_the_port(
-    readiness_service, fake_runner, monkeypatch
-):
-    """A listener in another process group is not ours — ours did not come up."""
-    monkeypatch.setattr(service_mod, "_port_answering", lambda port: False)
-    monkeypatch.setattr(procutil, "port_owner", _listens_after_start(fake_runner, 999))
-    monkeypatch.setattr(
-        procutil, "process_group_of", lambda pid: 1000 if pid == 1000 else 4242
-    )
-
-    res = readiness_service().env_up("webapp", cwd="/proj/webapp")
-
-    assert res["ok"] is False
-    assert res["error"] == "START_TIMEOUT"
-    assert fake_runner.stopped == [1000]
-
-
-def test_up_does_not_kill_when_the_probe_could_not_run(
-    readiness_service, fake_runner, monkeypatch
-):
-    """ProbeUnavailable is not evidence of absence — keep it, and say so.
-
-    Killing on a probe that could not answer is killing on ignorance. The lease
-    is written, so the process is tracked and swept rather than orphaned.
-    """
-    monkeypatch.setattr(service_mod, "_port_answering", lambda port: False)
-
-    def unavailable(port):
-        raise procutil.ProbeUnavailable("no usable port probe")
-
-    monkeypatch.setattr(procutil, "port_owner", unavailable)
-
-    res = readiness_service().env_up("webapp", cwd="/proj/webapp")
-
+def test_up_reports_a_probe_that_could_not_run(service, world):
+    world.readiness = "unknown"
+    res = service.env_up("webapp", cwd="/proj/webapp")
     assert res["ok"] is True
     assert res["readiness"] == "unknown"
-    assert fake_runner.stopped == []
     assert "swept rather than orphaned" in res["readiness_detail"]
 
 
-def test_up_does_not_kill_when_the_listener_cannot_be_attributed(
-    readiness_service, fake_runner, monkeypatch
-):
-    """Something listens but its group is unreadable → unknown, not absent."""
-    monkeypatch.setattr(service_mod, "_port_answering", lambda port: False)
-    monkeypatch.setattr(procutil, "port_owner", _listens_after_start(fake_runner, 31337))
-    monkeypatch.setattr(
-        procutil, "process_group_of", lambda pid: 1000 if pid == 1000 else None
-    )
-
-    res = readiness_service().env_up("webapp", cwd="/proj/webapp")
-
-    assert res["ok"] is True
-    assert res["readiness"] == "unknown"
-    assert fake_runner.stopped == []
-
-
-def test_answering_on_loopback_never_asks_who_owns_the_port(
-    readiness_service, fake_runner, monkeypatch
-):
-    """The common path must not pay for the rare one.
-
-    `port_owner` shells out to `lsof` on macOS. If the fast path consulted it,
-    every ordinary start would spawn a subprocess for nothing.
-    """
-    monkeypatch.setattr(service_mod, "_port_answering", lambda port: True)
-    asked: list[int] = []
-
-    def owner(port):
-        asked.append(port)
-        return None
-
-    monkeypatch.setattr(procutil, "port_owner", owner)
-
-    from rentctl.core.registry import BLOCK_SIZE
-
-    res = readiness_service().env_up("webapp", cwd="/proj/webapp")
-
+def test_up_answered_has_no_readiness_detail(service):
+    res = service.env_up("webapp", cwd="/proj/webapp")
     assert res["readiness"] == "answered"
-    # The draw scans the whole block once, to build its holders report. What
-    # matters here is that readiness adds nothing on top of that.
-    assert asked == list(range(5180, 5180 + BLOCK_SIZE))
+    assert "readiness_detail" not in res
 
 
 def test_renewing_a_lease_reports_that_readiness_was_not_probed(service):
@@ -1277,57 +1734,171 @@ def test_readiness_is_up_only_excludes_a_verified_absence():
     assert not Readiness.NOT_LISTENING.is_up
 
 
-def test_up_does_not_kill_when_our_own_process_group_is_unreadable(
-    readiness_service, fake_runner, monkeypatch
+# --- migration: legacy (1.0.x) leases (§14) ---------------------------------
+
+LEGACY_PID = 4242
+LEGACY_START = 1784000000.0
+
+
+def write_legacy(paths, clock, *, cwd="/proj/webapp", minutes=60, **kw) -> Path:
+    """A lease exactly as 1.0.x wrote it: no schema, a {pid, start} handle."""
+    lease = Lease(
+        project="webapp", profile="default", runner="process",
+        handle={"pid": LEGACY_PID, "pid_start_time": LEGACY_START}, port=5180, session="old",
+        cwd=cwd, created=clock(), expires=clock() + timedelta(minutes=minutes), log="/dev/null",
+        **kw,
+    )
+    path = paths.lease_file_for("webapp", cwd)
+    lease.write(path)
+    return path
+
+
+def test_legacy_lease_renewed_in_legacy_format(service, devctl_home, world, clock):
+    """A 1.0.x watchdog may still be babysitting it, so `up` renews it in place
+    in the format that watchdog reads (§14)."""
+    world.add_legacy_workload(LEGACY_PID, LEGACY_START)
+    path = write_legacy(devctl_home, clock, watchdog_pid=777, watchdog_pid_start_time=5.0)
+    clock.advance(minutes=30)
+    res = service.env_up("webapp", cwd="/proj/webapp")
+    assert res["ok"] is True and res["already_running"] is True
+    assert res["pid"] == LEGACY_PID
+    raw = json.loads(path.read_text())
+    assert "schema" not in raw and raw["watchdog_pid"] == 777
+    assert datetime.fromisoformat(raw["expires"]) == clock.now + timedelta(minutes=120)
+    assert world.sups == {}  # nothing new spawned
+    service.env_down("webapp", cwd="/proj/webapp")
+
+
+def test_legacy_lease_stop_uses_session_membership(service, devctl_home, world, clock):
+    """The legacy handle maps to its leader's session (§2): the stop reaches a
+    member whose leader is long gone, and is verified — here, in-process."""
+    world.add_legacy_workload(LEGACY_PID, LEGACY_START)
+    world.table.add(LEGACY_PID + 1, LEGACY_PID, LEGACY_START + 1, name="node")  # the child
+    world.table.kill_now(LEGACY_PID)  # the leader already exited (S1's shape)
+    path = write_legacy(devctl_home, clock)
+    res = service.env_down("webapp", cwd="/proj/webapp")
+    assert res["stopped"] is True and res["was_running"] is True
+    assert world.table.signals_to(LEGACY_PID + 1) == [signal.SIGTERM]
+    assert not path.exists()
+    down = [e for e in events(service) if e["event"] == "down"][-1]
+    assert down["mode"] == "recovery" and down["reason"] == "explicit"
+
+
+def test_session_end_hands_a_legacy_lease_to_a_recovery_supervisor(
+    service, devctl_home, world, clock
 ):
-    """The other side of attribution: we cannot read OUR group, so no comparison.
+    """R0: the hook never runs a recovery stop its 1.5 s could cut off halfway.
+    It spawns a detached recovery supervisor, which finishes the stop."""
+    world.add_legacy_workload(LEGACY_PID, LEGACY_START)
+    path = write_legacy(devctl_home, clock)
+    res = service.env_down(cwd="/proj/webapp", reason="session-end")
+    (row,) = res["downed"]
+    assert row["pending"] is True and "recovery supervisor" in row["detail"]
+    ((ref, key, gen, reason, source, op),) = world.recoveries
+    assert (reason, source, op) == ("session-end", "declared", "down")
+    # The request is on disk already, and the file is schema 2 now: a 1.0.x
+    # watchdog reading it gets CORRUPT and exits without touching anything.
+    assert json.loads(path.read_text())["watchdog_pid"] == "supervised"
+    world.tick()
+    assert not path.exists()
+    assert world.table.signals_to(LEGACY_PID) == [signal.SIGTERM]
 
-    Distinct from the case above, where theirs was unreadable. Same rule: no
-    comparison is possible, so nothing is proved, so nothing gets killed.
-    """
-    monkeypatch.setattr(service_mod, "_port_answering", lambda port: False)
-    monkeypatch.setattr(procutil, "port_owner", _listens_after_start(fake_runner, 31337))
-    monkeypatch.setattr(procutil, "process_group_of", lambda pid: None)
 
-    res = readiness_service().env_up("webapp", cwd="/proj/webapp")
-
-    assert res["ok"] is True
-    assert res["readiness"] == "unknown"
-    assert fake_runner.stopped == []
-
-
-def test_up_refuses_when_our_process_died_and_a_stranger_answers(
-    readiness_service, fake_runner, monkeypatch
+def test_a_legacy_lease_whose_workload_is_gone_is_cleaned_without_a_stop(
+    service, devctl_home, world, clock
 ):
-    """Readiness says the port is served; this says it is served by US.
-
-    The 2026-08-01 audit rated this its highest finding and I had not verified
-    it. It reproduces: a foreign listener answering loopback satisfies the
-    probe, so if our command dies on EADDRINUSE env_up returns ok:true over a
-    lease naming a pid that is already gone — and every later reconcile reads
-    that dead pid as a crashed server of ours.
-    """
-    monkeypatch.setattr(service_mod, "_port_answering", lambda port: True)  # a stranger
-    monkeypatch.setattr(procutil, "port_owner", lambda port: None)
-
-    svc = readiness_service()
-    real_start = fake_runner.start
-
-    def start_then_die(entry, port, log_path):
-        handle = real_start(entry, port, log_path)
-        fake_runner._alive[handle.pid] = False  # EADDRINUSE, exits immediately
-        return handle
-
-    monkeypatch.setattr(fake_runner, "start", start_then_die)
-
-    res = svc.env_up("webapp", cwd="/proj/webapp")
-
-    assert res["ok"] is False
-    assert res["error"] == START_TIMEOUT
-    assert "another process" in res["message"]
+    path = write_legacy(devctl_home, clock)  # no workload in the table
+    res = service.env_down(cwd="/proj/webapp", reason="session-end")
+    assert [d["stopped"] for d in res["downed"]] == [True]
+    assert [d["was_running"] for d in res["downed"]] == [False]
+    assert not path.exists() and world.recoveries == []
 
 
-# --- WI-0069: the watchdog is signalled only if it is provably ours ---------
+def test_down_on_an_ambiguous_legacy_lease_refuses_without_a_signal(
+    service, devctl_home, world, clock
+):
+    """PID S held by a different process while its session has members: nothing
+    under it can be proved ours. No request, no signal, lease untouched."""
+    world.table.add(LEGACY_PID, 1, LEGACY_START + 9999, name="stranger")  # reused pid
+    world.table.add(LEGACY_PID + 1, LEGACY_PID, LEGACY_START + 1, name="node")
+    path = write_legacy(devctl_home, clock)
+    before = path.read_bytes()
+    res = service.env_down("webapp", cwd="/proj/webapp")
+    assert res["stopped"] is False and res["identity_ambiguous"] is True
+    assert world.table.sent == []
+    assert path.read_bytes() == before
+    (incomplete,) = [e for e in events(service) if e["event"] == "cleanup_incomplete"]
+    assert incomplete["identity_ambiguous"] is True
+    up = service.env_up("webapp", cwd="/proj/webapp")
+    assert up["error"] == CLEANUP_INCOMPLETE and up["identity_ambiguous"] is True
+
+
+def test_an_expired_legacy_lease_is_swept_through_a_recovery_claim(
+    service, devctl_home, world, clock
+):
+    world.add_legacy_workload(LEGACY_PID, LEGACY_START)
+    path = write_legacy(devctl_home, clock, minutes=5)
+    clock.advance(minutes=6)
+    res = service.env_sweep()
+    assert [s["action"] for s in res["swept"]] == ["expire"]
+    assert not path.exists()
+    rec = events(service)[-1]
+    assert rec["reason"] == "sweep-expired" and rec["layer"] == 4 and rec["killed"] is True
+
+
+# --- §9: nobody waits while holding L ----------------------------------------
+
+def test_no_lock_held_while_waiting(service, devctl_home, world, clock, monkeypatch):
+    """Instrument `project_lock` everywhere the service reaches it, and fail if
+    any wait (the waiters' sleep, which is also when fake supervisors act) or
+    any recovery stop happens under it. Every hold is also bounded."""
+    held: list[str] = []
+    holds: list[float] = []
+    real_lock = service_mod.project_lock
+
+    @contextmanager
+    def instrumented(path):
+        with real_lock(path):
+            held.append(str(path))
+            import time as _t
+            t0 = _t.monotonic()
+            try:
+                yield
+            finally:
+                holds.append(_t.monotonic() - t0)
+                held.pop()
+
+    monkeypatch.setattr(service_mod, "project_lock", instrumented)
+    monkeypatch.setattr(supervision, "project_lock", instrumented)
+    real_sleep = world.sleep
+
+    def checked_sleep(seconds):
+        assert held == [], f"a waiter slept while holding {held}"
+        real_sleep(seconds)
+
+    world.sleep = checked_sleep
+    real_stop = supervision.stop_workload
+
+    def checked_stop(*a, **kw):
+        assert held == [], f"a recovery stop ran while holding {held}"
+        return real_stop(*a, **kw)
+
+    monkeypatch.setattr(supervision, "stop_workload", checked_stop)
+
+    service.env_up("webapp", cwd="/proj/A")                       # waits for running
+    service.env_up("webapp", cwd="/proj/B")
+    service.env_down("webapp", cwd="/proj/A")                     # waits for stopped
+    world.kill_supervisor(lease_key("webapp", "/proj/B"))
+    service.env_down("webapp", cwd="/proj/B")                     # inline recovery stop
+    world.stubborn = True
+    service.env_up("webapp", cwd="/proj/C")
+    clock.advance(hours=3)
+    world.kill_supervisor(lease_key("webapp", "/proj/C"))
+    service.env_sweep()                                           # recovery stop in sweep
+    assert holds and max(holds) < 1.0, max(holds)
+
+
+# --- WI-0069 / §3: a legacy watchdog is signalled only if provably ours ------
 #
 # Leases survive a reboot, and `claude --continue` skips the startup sweep, so a
 # SessionEnd teardown can meet a lease whose `watchdog_pid` now names somebody
@@ -1336,8 +1907,9 @@ def test_up_refuses_when_our_process_died_and_a_stranger_answers(
 # prove it was — or was not — sent. Nothing else on the machine is ever named.
 
 
-def _sleeper() -> subprocess.Popen:
-    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+def _sleeper(*marker: str) -> subprocess.Popen:
+    # A trailing argv marker is how a stand-in "is" a watchdog to the §3 check.
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", *marker])
 
 
 def _reap(child: subprocess.Popen) -> None:
@@ -1358,36 +1930,46 @@ def _skips(service) -> list[dict]:
     return [e for e in service.events.read() if e["event"] == "watchdog_signal_skipped"]
 
 
-def test_watchdog_with_matching_start_time_is_signalled(service, devctl_home):
-    child = _sleeper()
+@pytest.fixture
+def legacy_with_watchdog(service, devctl_home, world, clock):
+    """Write a live legacy lease naming ``child`` as its watchdog."""
+
+    def make(child: subprocess.Popen | None, start: float | None) -> Path:
+        world.add_legacy_workload(LEGACY_PID, LEGACY_START)
+        return write_legacy(
+            devctl_home, clock,
+            watchdog_pid=None if child is None else child.pid,
+            watchdog_pid_start_time=start,
+        )
+
+    return make
+
+
+def test_watchdog_with_matching_start_time_is_signalled(service, legacy_with_watchdog):
+    child = _sleeper("rentctl.watchdog")
     try:
         started = procutil.observe_start_time(child.pid)
         assert started is not None
-        service.watchdog_spawn = lambda key: ProcessHandle(pid=child.pid, pid_start_time=started)
-        service.env_up("webapp", cwd="/proj/webapp")
-        lease = Lease.read(devctl_home.lease_file_for("webapp", "/proj/webapp"))
-        assert lease.watchdog_pid == child.pid
-        assert lease.watchdog_pid_start_time == started
+        path = legacy_with_watchdog(child, started)
 
         res = service.env_down("webapp", cwd="/proj/webapp")
 
-        assert res["ok"] is True
+        assert res["ok"] is True and res["stopped"] is True
         assert child.wait(timeout=5) == -signal.SIGTERM
         assert _skips(service) == []
+        assert not path.exists()
     finally:
         _reap(child)
 
 
-def test_watchdog_pid_with_a_different_start_time_is_not_signalled(service, devctl_home):
+def test_watchdog_pid_with_a_different_start_time_is_not_signalled(service, legacy_with_watchdog):
     """The reboot case: the pid is alive, but it is not the process we spawned."""
-    child = _sleeper()
+    child = _sleeper("rentctl.watchdog")
     try:
         started = procutil.observe_start_time(child.pid)
         assert started is not None
-        recycled = ProcessHandle(pid=child.pid, pid_start_time=started - 3600.0)
-        service.watchdog_spawn = lambda key: recycled
+        path = legacy_with_watchdog(child, started - 3600.0)
 
-        service.env_up("webapp", cwd="/proj/webapp")
         res = service.env_down("webapp", cwd="/proj/webapp")
 
         assert res["ok"] is True
@@ -1397,22 +1979,30 @@ def test_watchdog_pid_with_a_different_start_time_is_not_signalled(service, devc
         assert skip["reason"] == "pid-recycled"
         # The teardown itself still completed: the guard narrows the watchdog
         # signal, it does not hold the lease hostage.
-        assert not devctl_home.lease_file_for("webapp", "/proj/webapp").exists()
+        assert not path.exists()
     finally:
         _reap(child)
 
 
-def test_legacy_lease_without_a_watchdog_start_time_is_not_signalled(service, devctl_home):
-    """A 1.0.1 lease records only the pid — there is nothing to verify it against."""
+def test_a_matching_pid_that_is_not_a_watchdog_is_not_signalled(service, legacy_with_watchdog):
+    """§3 adds the cmdline check: start time alone does not make it a watchdog."""
     child = _sleeper()
     try:
-        service.env_up("webapp", cwd="/proj/webapp")
-        path = devctl_home.lease_file_for("webapp", "/proj/webapp")
-        # Rewrite it exactly as 1.0.1 did: a watchdog pid and no start-time key.
-        raw = Lease.read(path).to_dict()
-        raw["watchdog_pid"] = child.pid
-        raw.pop("watchdog_pid_start_time", None)
-        path.write_text(json.dumps(raw))
+        started = procutil.observe_start_time(child.pid)
+        legacy_with_watchdog(child, started)
+        service.env_down("webapp", cwd="/proj/webapp")
+        assert _still_running(child)
+        (skip,) = _skips(service)
+        assert skip["reason"] == "not-a-watchdog"
+    finally:
+        _reap(child)
+
+
+def test_legacy_lease_without_a_watchdog_start_time_is_not_signalled(service, legacy_with_watchdog):
+    """A 1.0.1 lease records only the pid — there is nothing to verify it against."""
+    child = _sleeper("rentctl.watchdog")
+    try:
+        path = legacy_with_watchdog(child, None)
         assert Lease.read(path).watchdog_pid_start_time is None  # old leases still load
 
         res = service.env_down("webapp", cwd="/proj/webapp")
@@ -1422,76 +2012,26 @@ def test_legacy_lease_without_a_watchdog_start_time_is_not_signalled(service, de
         (skip,) = _skips(service)
         assert skip["pid"] == child.pid
         assert skip["reason"] == "unverifiable"
-        assert not path.exists()  # removing it is what makes a live watchdog exit
+        assert not path.exists()
     finally:
         _reap(child)
 
 
-def test_watchdog_that_is_already_gone_is_no_error(service, devctl_home):
-    child = _sleeper()
+def test_watchdog_that_is_already_gone_is_no_error(service, legacy_with_watchdog):
+    child = _sleeper("rentctl.watchdog")
     started = procutil.observe_start_time(child.pid)
     assert started is not None
     child.kill()
     child.wait(timeout=5)
-    service.watchdog_spawn = lambda key: ProcessHandle(pid=child.pid, pid_start_time=started)
+    path = legacy_with_watchdog(child, started)
 
-    service.env_up("webapp", cwd="/proj/webapp")
     res = service.env_down("webapp", cwd="/proj/webapp")
 
     assert res["ok"] is True
     assert res["was_running"] is True
-    assert not devctl_home.lease_file_for("webapp", "/proj/webapp").exists()
+    assert not path.exists()
     # A watchdog that exited on its own is the ordinary case, not a skipped kill.
     assert _skips(service) == []
-
-
-def test_spawn_watchdog_records_the_start_time(devctl_home, monkeypatch):
-    """The real spawner hands back a verifiable handle, not a bare pid."""
-    spawned: list[subprocess.Popen] = []
-    real_popen = subprocess.Popen
-
-    def popen_sleeper(argv, **kw):
-        # Same detachment as the real spawn, but a sleeper instead of a watchdog,
-        # so no rentctl process ever runs against this test's state.
-        proc = real_popen([sys.executable, "-c", "import time; time.sleep(60)"], **kw)
-        spawned.append(proc)
-        return proc
-
-    monkeypatch.setattr(service_mod.subprocess, "Popen", popen_sleeper)
-    svc = Service(devctl_home, watchdog_spawn=None)
-    try:
-        got = svc._spawn_watchdog("webapp--deadbeef")
-        (proc,) = spawned
-        assert isinstance(got, ProcessHandle)
-        assert got.pid == proc.pid
-        assert procutil.start_time_matches(got.pid_start_time, procutil.observe_start_time(proc.pid))
-    finally:
-        for proc in spawned:
-            _reap(proc)
-
-
-def test_spawn_watchdog_that_dies_before_observation_returns_a_bare_pid(
-    devctl_home, monkeypatch
-):
-    """No start time to record → a bare pid, which teardown will never signal."""
-    spawned: list[subprocess.Popen] = []
-    real_popen = subprocess.Popen
-
-    def popen_sleeper(argv, **kw):
-        proc = real_popen([sys.executable, "-c", "import time; time.sleep(60)"], **kw)
-        spawned.append(proc)
-        return proc
-
-    monkeypatch.setattr(service_mod.subprocess, "Popen", popen_sleeper)
-    monkeypatch.setattr(procutil, "observe_start_time", lambda pid: None)
-    svc = Service(devctl_home, watchdog_spawn=None)
-    try:
-        got = svc._spawn_watchdog("webapp--deadbeef")
-        (proc,) = spawned
-        assert got == proc.pid
-    finally:
-        for proc in spawned:
-            _reap(proc)
 
 
 def test_watchdog_that_exits_between_check_and_signal_is_no_error(service, monkeypatch):
@@ -1501,6 +2041,7 @@ def test_watchdog_that_exits_between_check_and_signal_is_no_error(service, monke
     so no real process is ever named by this test.
     """
     monkeypatch.setattr(procutil, "observe_start_time", lambda pid: 1784080000.0)
+    monkeypatch.setattr(Service, "_is_watchdog", staticmethod(lambda pid: True))
 
     def _vanished(pid, sig):
         raise ProcessLookupError(pid)
@@ -1522,3 +2063,218 @@ def test_watchdog_that_exits_between_check_and_signal_is_no_error(service, monke
     )
     service._kill_watchdog(lease)  # must not raise
     assert _skips(service) == []
+
+
+def test_new_code_never_spawns_a_watchdog():
+    """§14: the supervisor replaces it. The spawn path is gone, not dormant."""
+    import inspect
+
+    assert not hasattr(Service, "_spawn_watchdog")
+    assert "watchdog_spawn" not in inspect.signature(Service).parameters
+    assert service_mod.decide is lifecycle.decide  # §10's table, not the 1.0.x oracle
+
+
+# --- `up` over every lease state it can meet (§10, §14) ----------------------
+
+def _rewrite(paths, cwd, **fields) -> Lease:
+    path = paths.lease_file_for("webapp", cwd)
+    lease = Lease(**{**Lease.read(path).__dict__, **fields})
+    lease.write(path)
+    return lease
+
+
+def test_up_replaces_a_terminal_record_left_behind(service, devctl_home, world):
+    """A crash between the event and the unlink leaves `stopped` on disk. It
+    holds no port and names nothing running; a new generation replaces it."""
+    service.env_up("webapp", cwd="/proj/A")
+    world.kill_supervisor(lease_key("webapp", "/proj/A"))
+    old = _rewrite(devctl_home, "/proj/A", state="stopped")
+    res = service.env_up("webapp", cwd="/proj/A")
+    assert res["already_running"] is False
+    assert lease_at(devctl_home, "/proj/A").generation != old.generation
+
+
+def test_up_on_a_legacy_lease_whose_workload_is_gone_starts_fresh(service, devctl_home, world, clock):
+    write_legacy(devctl_home, clock)  # nothing in its session
+    res = service.env_up("webapp", cwd="/proj/webapp")
+    assert res["already_running"] is False and res["state"] == "running"
+    assert lease_at(devctl_home, "/proj/webapp").schema == 2
+    down = [e for e in events(service) if e["event"] == "down"][-1]
+    assert down["reason"] == "sweep-dead" and down["actor"] == "up"
+
+
+def test_up_on_an_expired_unsupervised_lease_recovers_it_then_starts_fresh(
+    service, devctl_home, world, clock
+):
+    service.env_up("webapp", lease_minutes=10, cwd="/proj/A")
+    world.kill_supervisor(lease_key("webapp", "/proj/A"))
+    service.env_ls()  # → unsupervised
+    clock.advance(minutes=11)
+    res = service.env_up("webapp", cwd="/proj/A")
+    assert res["already_running"] is False and res["pid"] == 1001
+    assert world.table.signals_to(1000) == [signal.SIGTERM]
+
+
+def test_up_on_an_ambiguous_unsupervised_lease_refuses(service, devctl_home, world):
+    service.env_up("webapp", cwd="/proj/A")
+    sup = world.kill_supervisor(lease_key("webapp", "/proj/A"))
+    service.env_ls()  # → unsupervised
+    world.table.add(sup.pid, 1, sup.start + 999, name="stranger")  # PID S reused
+    res = service.env_up("webapp", cwd="/proj/A")
+    assert res["error"] == CLEANUP_INCOMPLETE and res["identity_ambiguous"] is True
+    assert world.table.sent == []
+
+
+def test_up_on_a_starting_lease_whose_supervisor_died_reconciles_first(
+    service, devctl_home, world, clock
+):
+    key, _ = _start_elsewhere(devctl_home, world, clock)
+    world.kill_supervisor(key)  # dead before registering: nothing was launched
+    res = service.env_up("webapp", cwd="/proj/webapp")
+    assert res["ok"] is True and res["already_running"] is False
+    assert any(e.get("phase") == "registration" for e in events(service))
+
+
+def test_up_on_a_stopping_lease_waits_for_its_supervisor(service, devctl_home, world):
+    service.env_up("webapp", cwd="/proj/A")
+    lease = lease_at(devctl_home, "/proj/A")
+    stopping = transition(
+        lease, Event(EventKind.STOP_REQUEST, world.clock(), reason="explicit", op="down"),
+        Actor(ActorKind.CLI, lease.generation, supervision.self_ref()),
+    )
+    _rewrite(devctl_home, "/proj/A", state="stopping", stop=stopping.stop)
+    res = service.env_up("webapp", cwd="/proj/A")
+    assert res["already_running"] is False and res["pid"] == 1001
+
+
+def test_up_on_a_stopping_lease_with_a_dead_supervisor_resumes_its_stop(service, devctl_home, world):
+    service.env_up("webapp", cwd="/proj/A")
+    lease = lease_at(devctl_home, "/proj/A")
+    stopping = transition(
+        lease, Event(EventKind.STOP_REQUEST, world.clock(), reason="explicit", op="down"),
+        Actor(ActorKind.CLI, lease.generation, supervision.self_ref()),
+    )
+    _rewrite(devctl_home, "/proj/A", state="stopping", stop=stopping.stop)
+    world.kill_supervisor(lease_key("webapp", "/proj/A"))
+    res = service.env_up("webapp", cwd="/proj/A")
+    assert res["already_running"] is False
+    down = [e for e in events(service) if e["event"] == "down"][0]
+    assert down["reason"] == "explicit" and down["mode"] == "recovery"  # the original reason
+
+
+def test_up_waiting_on_a_stop_that_leaves_survivors_refuses(service, devctl_home, world):
+    world.stubborn = True
+    service.env_up("webapp", cwd="/proj/A")
+    service.env_down("webapp", cwd="/proj/A", wait_s=0)
+    res = service.env_up("webapp", cwd="/proj/A")
+    assert res["error"] == CLEANUP_INCOMPLETE
+    assert [s["pid"] for s in res["survivors"]] == [1000]
+
+
+def test_up_survives_a_failed_spawned_write(service, devctl_home, world, monkeypatch):
+    """The supervisor registers itself whether or not the CLI's SPAWNED write
+    landed (§6); the start still completes."""
+    real_write = Lease.write
+    calls = {"n": 0}
+
+    def second_write_fails(self, path):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("disk full")
+        real_write(self, path)
+
+    monkeypatch.setattr(Lease, "write", second_write_fails)
+    res = service.env_up("webapp", cwd="/proj/A")
+    assert res["ok"] is True and res["state"] == "running"
+
+
+# --- `down` edge paths ----------------------------------------------------------------
+
+def test_down_finishes_the_removal_of_a_terminal_record(service, devctl_home, world):
+    service.env_up("webapp", cwd="/proj/A")
+    world.kill_supervisor(lease_key("webapp", "/proj/A"))
+    _rewrite(devctl_home, "/proj/A", state="exited")
+    res = service.env_down("webapp", cwd="/proj/A")
+    assert res["stopped"] is True and res["was_running"] is False
+    assert lease_at(devctl_home, "/proj/A") is None
+
+
+def test_down_on_a_start_not_yet_registered_launches_nothing(service, devctl_home, world, clock):
+    """A stop recorded before registration: the supervisor refuses to register
+    over it and exits (I1); the waiter lets §10 abandon the record."""
+    _start_elsewhere(devctl_home, world, clock)
+    res = service.env_down("webapp", cwd="/proj/webapp")
+    assert res["stopped"] is True
+    assert world.started == []
+    assert lease_at(devctl_home, "/proj/webapp") is None
+
+
+def test_down_when_no_recovery_supervisor_can_start_says_so(service, devctl_home, world, clock):
+    world.add_legacy_workload(LEGACY_PID, LEGACY_START)
+    write_legacy(devctl_home, clock)
+    world.spawn_error = DevctlError(SUPERVISOR_START_FAILED, "fork failed")
+    res = service.env_down(cwd="/proj/webapp", reason="session-end")
+    (row,) = res["downed"]
+    assert row["pending"] is True
+    assert "next `rent sweep` resumes it" in row["detail"]
+    # …and it does.
+    world.spawn_error = None
+    service.env_sweep()
+    assert lease_at(devctl_home, "/proj/webapp") is None
+
+
+def test_down_on_cleanup_incomplete_waits_for_the_retry_it_asks_for(service, devctl_home, world):
+    """§8: a request on `cleanup_incomplete` triggers an immediate retry; the
+    answer is that retry's outcome, not the previous attempt's record."""
+    world.stubborn = True
+    service.env_up("webapp", cwd="/proj/A")
+    first = service.env_down("webapp", cwd="/proj/A")
+    assert first["stopped"] is False
+    again = service.env_down("webapp", cwd="/proj/A")      # retried, still stuck
+    assert again["stopped"] is False
+    assert lease_at(devctl_home, "/proj/A").cleanup.attempts == 2
+    for proc in world.table.procs.values():
+        proc.unkillable = proc.ignores_term = False         # the survivor becomes stoppable
+    last = service.env_down("webapp", cwd="/proj/A")
+    assert last["stopped"] is True
+    assert lease_at(devctl_home, "/proj/A") is None
+
+
+def test_down_all_runs_unsupervised_recoveries_concurrently(
+    service, devctl_home, write_registry, sample_registry_data, world
+):
+    sample_registry_data["projects"]["worldcup"] = {
+        "block": 5190, "runner": "process",
+        "profiles": {"default": {"cmd": "npm run dev", "cwd": "/tmp/wc", "port_env": "PORT"}},
+    }
+    write_registry(sample_registry_data)
+    service.env_up("webapp", cwd="/proj/A")
+    service.env_up("worldcup", cwd="/proj/A")
+    world.kill_supervisor(lease_key("webapp", "/proj/A"))
+    world.kill_supervisor(lease_key("worldcup", "/proj/A"))
+    res = service.env_down(cwd="/proj/A")
+    assert [d["stopped"] for d in res["downed"]] == [True, True]
+    assert devctl_home.project_lease_files("webapp") == []
+
+
+def test_a_supervisor_that_dies_mid_wait_is_recovered_by_the_waiter(
+    service, devctl_home, world, monkeypatch
+):
+    service.env_up("webapp", cwd="/proj/A")
+    key = lease_key("webapp", "/proj/A")
+    world.hung = True
+    ticks = {"n": 0}
+    real_sleep = world.sleep
+
+    def sleep_then_lose_it(seconds):
+        ticks["n"] += 1
+        if ticks["n"] == 3:
+            world.kill_supervisor(key)
+        real_sleep(seconds)
+
+    world.sleep = sleep_then_lose_it
+    res = service.env_down("webapp", cwd="/proj/A")
+    assert res["stopped"] is True
+    down = [e for e in events(service) if e["event"] == "down"][-1]
+    assert down["mode"] == "recovery" and down["reason"] == "explicit"
+

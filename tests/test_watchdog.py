@@ -83,6 +83,39 @@ def test_watch_once_corrupt_lease(devctl_home):
     assert watchdog.watch_once(KEY, devctl_home, NOW, factory(FakeRunner())) == CORRUPT
 
 
+@pytest.mark.parametrize(
+    "state",
+    ["starting", "running", "stopping", "cleanup_incomplete", "unsupervised", "startup_failed"],
+)
+def test_watch_once_exits_cleanly_on_a_schema2_lease(devctl_home, state):
+    """ADR-0016 §14: a supervisor owns a schema-2 lease. A watchdog that finds
+    one under its key exits without touching it — including a `starting` lease
+    whose empty handle would crash `process_handle()`."""
+    from dataclasses import replace
+
+    from rentctl.core.leases import SupervisorRef
+    from rentctl.core.lifecycle import new_starting_lease
+
+    lease = new_starting_lease(
+        generation="a" * 32, project="webapp", profile="default", runner="process", port=5180,
+        session="s", cwd="/x", spawn_cwd="/x", log="/l",
+        plan={"cmd": "true", "cwd": "/x", "port_env": "PORT"}, now=NOW,
+        expires=NOW - timedelta(minutes=1),  # expired: a legacy watchdog would stop it
+    )
+    if state != "starting":
+        lease = replace(lease, state=state, supervisor=SupervisorRef(9_000_000, 1.0, True))
+    path = devctl_home.lease_file_for("webapp", "/x")
+    lease.write(path)
+    before = path.read_bytes()
+    r = FakeRunner()
+    log = EventLog(devctl_home.events_file)
+    assert watchdog.watch_once(KEY, devctl_home, NOW, factory(r), log) == watchdog.SUPERVISED
+    assert path.read_bytes() == before
+    assert r.stopped == [] and log.read() == []
+    assert watchdog.run(KEY, devctl_home, now_fn=lambda: NOW, sleep_fn=lambda s: None,
+                        runner_factory=factory(r), events=log) == watchdog.SUPERVISED
+
+
 def test_run_loops_until_expired(devctl_home):
     r = FakeRunner()
     write_lease(devctl_home, r, expires_min=3)  # expires 3 min out
@@ -127,6 +160,45 @@ def test_main_smoke(devctl_home, capsys):
     assert "exit-lease-gone" in capsys.readouterr().out
 
 
+def test_main_prints_one_deprecation_line_on_stderr(devctl_home, capsys):
+    """ADR-0016 §14: the console scripts stay (removal is 2.0) and say they are
+    deprecated — on stderr, one line, so the outcome on stdout is untouched."""
+    watchdog.main([KEY, "--interval", "0.01"])
+    out, err = capsys.readouterr()
+    assert out.strip() == "exit-lease-gone"
+    assert err.count("\n") == 1 and "deprecated" in err and "1.0.x" in err
+
+
+def test_main_exits_supervised_on_a_schema2_lease(devctl_home, capsys):
+    """Invoked as the entry point against a supervisor's lease, the shim exits
+    with `exit-lease-supervised` and rc 0, leaving the file byte-identical."""
+    from rentctl.core.lifecycle import new_starting_lease
+
+    lease = new_starting_lease(
+        generation="b" * 32, project="webapp", profile="default", runner="process", port=5180,
+        session="s", cwd="/x", spawn_cwd="/x", log="/l",
+        plan={"cmd": "true", "cwd": "/x", "port_env": "PORT"}, now=NOW,
+        expires=NOW - timedelta(minutes=1),
+    )
+    path = devctl_home.lease_file_for("webapp", "/x")
+    lease.write(path)
+    before = path.read_bytes()
+    assert watchdog.main([KEY, "--interval", "0.01"]) == 0
+    assert capsys.readouterr().out.strip() == watchdog.SUPERVISED
+    assert path.read_bytes() == before
+
+
+def test_console_scripts_still_point_at_the_shim():
+    """Removing `rent-watchdog`/`devctl-watchdog` is an interface change (WI-0083, 2.0)."""
+    import tomllib
+    from pathlib import Path
+
+    scripts = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    )["project"]["scripts"]
+    assert scripts["rent-watchdog"] == scripts["devctl-watchdog"] == "rentctl.watchdog:main"
+
+
 # --- event log: the only source of cleanup-layer-3 evidence (spec §8, §11.1 G4) ---
 
 def _events(devctl_home):
@@ -149,8 +221,11 @@ def test_a_survivor_is_not_recorded_as_a_layer_3_kill(devctl_home):
     write_lease(devctl_home, r, expires_min=-1)
     verdict = watchdog.watch_once(KEY, devctl_home, NOW, factory(r))
     (rec,) = _events(devctl_home)
-    assert rec["killed"] is False
-    assert rec["stop_failed"] is True
+    # Not a `down` at all (ADR-0016 §13): nothing was torn down, so no layer
+    # may be credited, and `summarize` does not count it as a teardown.
+    assert rec["event"] == "cleanup_incomplete"
+    assert "layer" not in rec and "killed" not in rec
+    assert rec["reason"] == ev.EXPIRY
     assert verdict == watchdog.CONTINUE      # retry next tick, do not call it done
 
 

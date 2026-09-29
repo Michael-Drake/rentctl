@@ -4,22 +4,29 @@ from __future__ import annotations
 
 import pytest
 
+from datetime import datetime
+
+from fakesup import FakeSupervision
 from rentctl import mcp_server as m
-from rentctl.core.models import Readiness
 from rentctl.core.service import Service
 
-from conftest import FakeRunner
+from conftest import CDT, Clock
 
 
 @pytest.fixture
-def mcp_service(devctl_home, write_registry, sample_registry_data, monkeypatch):
+def world(devctl_home):
+    return FakeSupervision(devctl_home, Clock(datetime(2026, 7, 14, 8, 0, tzinfo=CDT)))
+
+
+@pytest.fixture
+def mcp_service(devctl_home, write_registry, sample_registry_data, monkeypatch, world):
     write_registry(sample_registry_data)
-    runner = FakeRunner()
     svc = Service(
         devctl_home,
-        runner_factory=lambda name: runner,
-        readiness_fn=lambda port, timeout, pgid: Readiness.ANSWERED,
-        watchdog_spawn=lambda p: None,
+        now_fn=world.clock,
+        supervision=world,
+        term_grace_s=0.05,
+        kill_grace_s=0.05,
         # Injected rather than monkeypatched: nothing here fakes a squatter, so
         # there is no later `setattr` to leave room for. Both probes must be
         # stubbed or these tests read the developer's machine — they asserted
@@ -62,6 +69,39 @@ def test_env_down(mcp_service):
     m.env_up("webapp")
     res = m.env_down("webapp")
     assert res["ok"] is True
+    assert res["stopped"] is True
+
+
+def test_env_down_waits_a_bounded_15s_then_reports_pending(mcp_service, world):
+    """R6: an agent that asked for a stop normally sees it complete; a stop that
+    takes longer comes back `pending` (still ok) after 15 s, not later."""
+    m.env_up("webapp")
+    world.hung = True
+    start = world.monotonic()
+    res = m.env_down("webapp")
+    assert res["ok"] is True and res["pending"] is True
+    assert world.monotonic() - start == pytest.approx(m.MCP_DOWN_WAIT_S, abs=0.2)
+    world.hung = False
+    world.tick()
+
+
+def test_env_down_wait_s_is_clamped(mcp_service, world):
+    m.env_up("webapp")
+    world.hung = True
+    start = world.monotonic()
+    res = m.env_down("webapp", wait_s=10_000)
+    assert res["pending"] is True
+    assert world.monotonic() - start == pytest.approx(m.MCP_MAX_WAIT_S, abs=0.2)
+    world.hung = False
+    world.tick()
+
+
+def test_env_down_wait_zero_is_fire_and_forget(mcp_service, world):
+    m.env_up("webapp")
+    res = m.env_down("webapp", wait_s=0)
+    assert res["pending"] is True
+    world.tick()
+    assert m.env_ls()["environments"] == []
 
 
 def test_svc_lazily_built(devctl_home, monkeypatch):

@@ -111,6 +111,7 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
     "integration: spawns real processes and touches tmp state dirs (deselect with -m 'not integration')",
+    "network: needs uv and PyPI, e.g. the 1.0.1 cross-version test (deselect with -m 'not network')",
 ]
 
 [tool.coverage.run]

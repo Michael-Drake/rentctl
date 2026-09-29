@@ -42,6 +42,16 @@ CMD_CHANGED = "CMD_CHANGED"              # devctl.toml no longer matches the app
 UNKNOWN_RUNTIME = "UNKNOWN_RUNTIME"      # --runtime named an agent runtime with no binding (ADR-0011)
 CANNOT_ADOPT = "CANNOT_ADOPT"            # --adopt found no single usable registry entry (ADR-0012)
 
+# --- the per-lease supervisor (ADR-0016 §14) --------------------------------
+# Declared with the supervisor (plan step 4) because its `startup_failed`
+# record carries them in `error.code`; the service lanes surface them.
+
+STATE_WRITE_FAILED = "STATE_WRITE_FAILED"  # a lease transition could not be written
+SUPERVISOR_START_FAILED = "SUPERVISOR_START_FAILED"  # the supervisor could not be spawned
+STOP_IN_PROGRESS = "STOP_IN_PROGRESS"    # `up` on a lease still stopping past the wait
+CLEANUP_INCOMPLETE = "CLEANUP_INCOMPLETE"  # `up` on a lease whose survivors are still named
+UNSUPERVISABLE = "UNSUPERVISABLE"        # the command's listener left the session (daemonized)
+
 
 class DevctlError(Exception):
     """A failure with a stable ``code`` for the JSON error envelope.

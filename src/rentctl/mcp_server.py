@@ -17,7 +17,12 @@ from mcp.server.fastmcp import FastMCP
 from . import __version__
 from .core import wiring
 from .core.events import EXPLICIT
-from .core.service import DEFAULT_LEASE_MINUTES, Service
+from .core.service import DEFAULT_LEASE_MINUTES, DOWN_WAIT_S, Service
+
+# ADR-0016 R6: an agent that asked for a stop should normally see it complete,
+# and the wait is bounded so no turn is held hostage by a stubborn workload.
+MCP_DOWN_WAIT_S = DOWN_WAIT_S
+MCP_MAX_WAIT_S = 60.0
 
 # The advertised server identity must match the `mcpServers` key enrollment writes
 # (ADR-0009, WI-0017) — a server whose handshake name disagrees with the key it is
@@ -51,11 +56,18 @@ def env_up(
 
 
 @mcp.tool()
-def env_down(project: str | None = None) -> dict:
-    """Stop a project's environment; omit ``project`` to down all leased to this cwd."""
+def env_down(project: str | None = None, wait_s: float | None = None) -> dict:
+    """Stop a project's environment; omit ``project`` to down all leased to this cwd.
+
+    Waits up to ``wait_s`` seconds (default 15, at most 60) for verified
+    cleanup. Past that the result is ``pending: true`` — still ``ok``: the
+    environment's supervisor finishes the stop, and ``env_ls`` shows the outcome.
+    """
     # Always cleanup layer 1, in both shapes: hooks cannot call MCP tools, so an
     # MCP teardown is by construction the polite path and never a SessionEnd kill.
-    return _svc().env_down(project, reason=EXPLICIT)
+    # Bounded (R6): an agent turn is never held longer than MCP_MAX_WAIT_S.
+    wait = MCP_DOWN_WAIT_S if wait_s is None else min(max(0.0, float(wait_s)), MCP_MAX_WAIT_S)
+    return _svc().env_down(project, reason=EXPLICIT, wait_s=wait)
 
 
 @mcp.tool()

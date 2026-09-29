@@ -30,8 +30,15 @@ uv tool install rentctl        # or: pipx install rentctl, or: pip install rentc
 ```
 
 Requires Python 3.12+. **macOS and Linux.** There is no Windows support and no Windows
-claim — process-group teardown is the safety-critical mechanism here, and it has no
-tested Windows equivalent yet.
+claim — POSIX sessions are the safety-critical mechanism here, and they have no tested
+Windows equivalent yet.
+
+**Upgrading from 1.0.x? Drain first.** Run `rent down --all` in each project before you
+upgrade, then restart your agent sessions so their MCP servers load the new version.
+Skipping it is safe but degraded: a 1.0.x environment keeps working under 1.1 — `rent
+up` renews it, and `rent down` and `rent sweep` stop it by its whole session — but a
+1.0.x watchdog still running from before the upgrade enforces its expiry with the old
+code, which can miss a child that outlived its shell.
 
 ## First run
 
@@ -75,22 +82,29 @@ $ rent up hello
 {
   "ok": true,
   "project": "hello",
+  …
   "url": "http://localhost:6200",
   "port": 6200,
-  "lease_expires": "2026-09-28T13:32:36.428730-05:00",
-  "already_running": false,
-  "readiness": "answered",
   …
+  "lease_expires": "2026-09-28T15:50:21.327166-05:00",
+  "already_running": false,
+  "state": "running",
+  "supervisor_pid": 24202,
+  …
+  "readiness": "answered"
 }
 
-$ rent ls                      # one row: hello, port 6200, "healthy": true
+$ rent ls                      # one row: hello, port 6200, "state": "running", "healthy": true
 $ curl -sI http://localhost:6200/
 HTTP/1.0 200 OK
 
-$ rent down --all --cwd .      # exactly what the SessionEnd hook runs
+$ rent down --all --cwd . --reason session-end    # what the SessionEnd hook runs
 {
   "ok": true,
-  "downed": [ { "project": "hello", "port": 6200, "was_running": true, … } ]
+  …
+  "downed": [ { "project": "hello", …, "port": 6200, "was_running": true,
+                "stopped": null, "pending": true, "state": "stopping",
+                "detail": "supervisor 24202 is completing cleanup; rent ls shows the outcome" } ]
 }
 
 $ curl -sI http://localhost:6200/ || echo gone
@@ -99,6 +113,9 @@ gone
 
 (Output trimmed where marked `…`.) That last step is the whole product: in an enrolled
 Claude Code or Gemini CLI session you never type `rent down` — the session ending does.
+The hook doesn't wait for the server to die; it asks, and the environment's supervisor
+finishes the job (see [How cleanup actually happens](#how-cleanup-actually-happens)).
+`rent down hello`, typed by hand, waits and answers `"stopped": true`.
 `rent events --summary` afterwards shows the teardown and which cleanup layer did it.
 
 If something doesn't behave, see [Troubleshooting](#troubleshooting).
@@ -141,8 +158,9 @@ a contiguous block of 10 ports.
 
 ```
 rent up myapp              # start (or renew) — prints the URL and the port
+rent down myapp            # stop it; waits up to 15 s (--wait SECONDS, --wait 0 = don't wait)
 rent down --all --cwd .    # stop everything leased to this directory
-rent ls                    # every environment on this machine
+rent ls                    # every environment on this machine, with its state
 rent sweep                 # reconcile: stop what's expired or dead
 rent events --summary      # what happened, and which cleanup layer did it
 rent sync                  # re-approve a changed rentctl.toml
@@ -163,7 +181,7 @@ renews it rather than starting a second server.
 
 | Client | How it is wired | Session-end cleanup |
 |---|---|---|
-| Claude Code | the plugin, or `rent init` (`.mcp.json` + `.claude/settings.local.json`) | **Yes** — SessionEnd runs `rent down --all --cwd "$CLAUDE_PROJECT_DIR"`; SessionStart runs `rent sweep` |
+| Claude Code | the plugin, or `rent init` (`.mcp.json` + `.claude/settings.local.json`) | **Yes** — SessionEnd runs `rent down --all --cwd "$CLAUDE_PROJECT_DIR" --reason session-end`; SessionStart runs `rent sweep` |
 | Gemini CLI | `rent init` (`.gemini/settings.json`), when Gemini is used in the project or installed | **Yes** — same hooks, scoped by `$GEMINI_PROJECT_DIR` |
 | Any other MCP client | register `rent-mcp` yourself | **No** — lease expiry and sweep only |
 | A plain shell | `rent` | **No** — lease expiry and sweep only |
@@ -187,16 +205,48 @@ running.
 
 ## How cleanup actually happens
 
-Four independent layers, so no single failure leaves an orphan:
+Every environment has its own **supervisor**: a small rentctl process that starts your
+command inside a POSIX session it owns and stays until that whole session — the command,
+its children, and anything they spawned — has been checked and found empty. The lease is
+written before the command starts, so there is no moment when something is running that
+rentctl has no record of.
+
+Every stop, whatever asked for it, is the same: `SIGTERM` to every process in the
+session, `SIGTERM` to anything forked while it shuts down, `SIGKILL` to each process
+still there after 10 s, then a final scan. A child that ignores `SIGTERM`, or that
+outlived the shell that launched it, is stopped with the rest.
+
+Four independent layers decide *when*, so no single failure leaves an orphan:
 
 1. **You ask** — `rent down`.
-2. **The session ends** — a `SessionEnd` hook tears down everything leased to that
-   directory.
-3. **The lease expires** — a detached watchdog per lease kills it after expiry, even if
-   the session died without running its hook. It checks once a minute, so teardown lands
-   up to ~60 s after the lease runs out, not at the instant.
-4. **The next sweep** — `rent sweep` (which the hooks also run at session start) stops
-   anything expired or already dead that the first three missed.
+2. **The session ends** — a `SessionEnd` hook asks for a stop of everything leased to
+   that directory.
+3. **The lease expires** — the supervisor starts the stop within about a second of the
+   lease running out, even if the session died without running its hook.
+4. **The next sweep** — `rent sweep` (which the hooks also run at session start) and
+   `rent ls` clean up what the first three missed, including an environment whose
+   supervisor was killed.
+
+**What `rent down` tells you** is what the lease says, in one of three shapes:
+
+- `"stopped": true` — the session was scanned empty and the lease removed.
+- `"stopped": false, "state": "cleanup_incomplete", "survivors": [...]` — something could
+  not be stopped (a child that switched user with `sudo`, say). The lease is **kept**, so
+  the survivors stay named and the port stays out of the draw; the supervisor keeps
+  retrying (5 s, 15 s, 60 s, then every minute), `rent down` retries at once, and `rent
+  up` refuses with `CLEANUP_INCOMPLETE` until it clears.
+- `"stopped": null, "pending": true` — the stop was accepted and is still running;
+  `rent ls` shows how it ended. This is `"ok": true`: the supervisor finishes regardless.
+
+`rent down` waits up to 15 s for the first two (`--wait SECONDS`; `--wait 0` returns
+at once). The MCP tool `env_down` takes the same wait as `wait_s` — 15 s by default,
+60 s at most.
+
+**Session end returns fast; cleanup finishes in the background.** Claude Code gives a
+plugin's `SessionEnd` hook about 1.5 s. So the hook's `rent down --all --reason
+session-end` doesn't wait: it records a stop for every lease, wakes each supervisor, and
+returns `pending`. The supervisors don't need the session to finish. A lease with no
+living supervisor is handed to a detached recovery process rather than stopped halfway.
 
 **A crashed session is cleaned up by layers 3 and 4, not 2.** If the session dies
 without firing its hook, its server keeps running until the lease expires — up to the
@@ -204,9 +254,44 @@ full lease length. Shorter leases (`rent up myapp --lease-minutes 30`) shorten t
 window. A sweep does not stop a live, unexpired lease; it cannot tell a crashed session
 from one that is still working.
 
-There is **no daemon.** State lives on disk and the OS process table is the source of
-truth, so there is no background service to babysit, and nothing to resurrect after a
-reboot.
+**If a supervisor is killed, recovery waits for the next command.** The server keeps
+serving. The next `rent ls`, `sweep`, `up` or `down` notices, marks the lease
+`unsupervised`, and records `supervisor_lost`; it is not killed early. At its expiry the
+next of those commands stops it, and `rent down` stops it now. Nothing notices at the
+moment the supervisor dies, because nothing else is running to notice.
+
+There is **no daemon.** There is one supervisor per live environment, and it exits once
+its environment is verified gone. State lives on disk and the OS process table is the
+source of truth, so there is no background service to babysit, and nothing to resurrect
+after a reboot.
+
+### What supervision covers, per platform
+
+**macOS.** Every process that stays in the environment's session is found and stopped:
+orphans of a launch shell that exited, processes that ignore `SIGTERM`, processes that
+move into their own process group, children forked during shutdown. A process that calls
+`setsid()` — which is what daemonizing (double-fork plus `setsid`) does — leaves the
+session and is **outside** supervision. rentctl never signals it; if it holds the lease's
+port, the teardown reports it. When a command daemonizes during startup — its own
+session empties while a process outside it answers the port — `rent up` fails with
+`UNSUPERVISABLE` instead of reporting a start it cannot own. Run such servers in the
+foreground.
+
+**Linux.** Each supervisor also makes itself a *child subreaper*
+(`prctl(PR_SET_CHILD_SUBREAPER)`, no privileges needed), so orphaned descendants are
+reparented to it instead of to init. Every descendant of your command is captured,
+including a daemon that double-forks and calls `setsid()`. Signals to single processes
+go through a pidfd where the kernel has them. What still escapes is work that is not
+your command's descendant — handed to another manager such as `systemd-run`, a
+container runtime, an already-running `tmux` server, or `at`/`cron` — and the orphaned
+children of a process placed in another PID namespace with `setns(2)` (which needs
+`CAP_SYS_ADMIN` over that namespace): they go to that namespace's init. The capture also
+ends if the supervisor itself is killed. Where the subreaper is refused (some
+restricted containers), Linux gets the macOS guarantee.
+
+`rent doctor` reports which one is in effect: `supervision: session` or
+`supervision: session+subreaper`. **Neither is a sandbox** — a command that sets out to
+escape supervision can.
 
 ### One active session per checkout
 
@@ -221,9 +306,13 @@ sessions in one checkout are a known limitation, with no fix promised yet.
 
 ### It won't kill things it doesn't own
 
-Every lease records the process's PID **and its start time**. Before killing anything,
-`rentctl` re-checks both. If the PID was recycled onto some unrelated process, the start
-times disagree and it refuses — a stale lease can't get your database killed.
+Every lease records its supervisor's PID **and start time**, and the supervisor's PID is
+the environment's session id (a lease from 1.0.x uses its server's instead). A process is the environment's only if it is in that
+session (or, on Linux, descends from the supervisor), and each one's identity is
+re-checked immediately before it is signalled. If the session's PID has been recycled
+onto some unrelated process, nothing under it can be proved ours: the lease is kept,
+marked `identity_ambiguous`, and nothing is signalled — a stale lease can't get your
+database killed.
 
 A listener inside an enrolled project's port block with no lease behind it is a
 **squatter**. What happens to it depends on the machine's enforcement mode:
@@ -305,12 +394,28 @@ their session are *supposed* to. Keep it on development machines.
 ## Troubleshooting
 
 - **`rent doctor`** checks that the `rent` shim runs, the registry loads, and each
-  enrolled project's hooks are wired. If `rent` itself is missing, the same check runs
+  enrolled project's hooks are wired, and says which supervision level this host gets. If `rent` itself is missing, the same check runs
   as `python3 -m rentctl.doctor`.
 - **Server logs** are in `~/.local/state/devctl/logs/<project>-<timestamp>.log` (under
   `$XDG_STATE_HOME` if set). A failed `rent up` includes the log's tail in its output.
 - **What happened, and why**: `rent events` lists every start and teardown with the layer
-  that did it; the raw log is `~/.local/state/devctl/events.jsonl`.
+  that did it; the raw log is `~/.local/state/devctl/events.jsonl`. A teardown's `down`
+  event says whether the stop was verified and whether it needed `SIGKILL`
+  (`"escalated": true`). `stop_requested` means a stop was asked for (for example by the
+  session-end hook) and is not itself a teardown.
+- **`rent ls` shows each lease's `state`** and whether its supervisor is alive:
+  - `stopping` or `"pending": true` — a stop is under way; look again in a few seconds.
+  - `unsupervised` — its supervisor died. The server is still yours and still serving;
+    it is stopped at expiry by the next `ls`/`sweep`/`up`/`down`, or now by `rent down`.
+    `rent up` will not renew it. (A lease started by 1.0.x also reads `unsupervised`,
+    with `"legacy": true`; `rent up` does renew that one.)
+  - `cleanup_incomplete` with `survivors` — those PIDs would not die. Find out why (a
+    different user? stuck in the kernel?) before reusing the port; `rent down` retries.
+- **`UNSUPERVISABLE` from `rent up`** — the command daemonized, so its server left the
+  session rentctl supervises. Run it in the foreground. The stray server is left alone;
+  stop it yourself.
+- **The supervisor notes what it did in the server's log**, on lines prefixed
+  `[rentctl supervisor <pid>]`.
 - The registry of enrolled projects and approved commands is
   `~/.config/devctl/registry.json`. It is rentctl's own record — change it with
   `rent init` / `rent sync`, not by hand.
@@ -325,7 +430,12 @@ Stated plainly, because a tool making safety claims should be honest about its e
 - **The approval pin covers the command, not the code** — see Security.
 - **One active session per checkout** — see above; use worktrees for parallel sessions.
 - **Crash cleanup waits for expiry** — a session that dies without its hook leaves its
-  server up until the lease runs out (plus up to a minute).
+  server up until the lease runs out.
+- **Recovery waits for the next command** — if a supervisor is killed, nothing acts
+  until the next `rent ls`/`sweep`/`up`/`down`.
+- **Daemonizing commands are not supervised on macOS**, and on Linux work handed to
+  another process manager is not — see
+  [What supervision covers](#what-supervision-covers-per-platform).
 - **Only Claude Code and Gemini CLI get session-end hooks.** Other clients get expiry and
   sweep.
 - `runner = "compose"` is designed but not implemented. Asking for it fails with a clear

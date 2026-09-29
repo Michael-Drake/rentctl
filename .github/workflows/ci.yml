@@ -68,6 +68,14 @@ jobs:
         # rather than this number.
         run: uv run --extra dev pytest -q -rs --cov --cov-fail-under=90
 
+      - name: ADR-0016 Linux evidence (subreaper, pidfd, /proc session field)
+        # The ADR's L1/L5/L6 checklist, printed as `key: value` lines for the
+        # record. The assertions live in the suite's Linux-only tests (run in
+        # the step above); this is the raw evidence behind them. It spawns only
+        # its own helpers, binds no ports and touches no rentctl state.
+        if: runner.os == 'Linux'
+        run: uv run python scripts/supervision_probe.py linux
+
   wheel:
     # The job above tests the SOURCE. This one tests the ARTIFACT: build the wheel,
     # install it into a clean venv, run the same suite against the installed package,
